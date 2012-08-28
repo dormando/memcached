@@ -130,7 +130,8 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
                 search->refcount = 1;
                 do_item_unlink_nolock(search, hv);
             }
-            item_trylock_unlock(hold_lock);
+            if (hold_lock)
+                item_trylock_unlock(hold_lock);
             continue;
         }
 
