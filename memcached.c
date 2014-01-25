@@ -548,6 +548,10 @@ void conn_free(conn *c) {
             free(c->suffixlist);
         if (c->iov)
             free(c->iov);
+        /* Really remote potential leak... You'd have to be fetching stats and
+         * breaking the connection a million times. */
+        if (c->write_and_free)
+            free(c->write_and_free);
         STATS_LOCK();
         stats.conn_memory_bytes -= sizeof(conn) + c->rsize + c->wsize + sizeof(item *) * c->isize + sizeof(struct iovec) * c->iovsize + sizeof(struct msghdr) * c->msgsize + sizeof(char *) * c->suffixsize + c->hdrsize * UDP_HEADER_SIZE;
         stats.conn_structs--;
