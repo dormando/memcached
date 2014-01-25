@@ -272,6 +272,7 @@ struct stats {
     uint64_t      evicted_unfetched; /* items evicted but never touched */
     bool          slab_reassign_running; /* slab reassign in progress */
     uint64_t      slabs_moved;       /* times slabs were moved around */
+    uint64_t      conn_memory_bytes; /* Bytes used by connection structures */
 };
 
 #define MAX_VERBOSITY_LEVEL 2

@@ -251,6 +251,10 @@ static int add_msghdr(conn *c)
             STATS_UNLOCK();
             return -1;
         }
+        STATS_LOCK();
+        stats.conn_memory_bytes -= sizeof(struct msghdr) * c->msgsize;
+        stats.conn_memory_bytes += (sizeof(struct msghdr) * c->msgsize) * 2;
+        STATS_UNLOCK();
         c->msglist = msg;
         c->msgsize *= 2;
     }
@@ -407,6 +411,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 
         STATS_LOCK();
         stats.conn_structs++;
+        stats.conn_memory_bytes += sizeof(conn) + c->rsize + c->wsize + sizeof(item *) * c->isize + sizeof(struct iovec) * c->iovsize + sizeof(struct msghdr) * c->msgsize + sizeof(char *) * c->suffixsize;
         STATS_UNLOCK();
     }
 
@@ -543,6 +548,10 @@ void conn_free(conn *c) {
             free(c->suffixlist);
         if (c->iov)
             free(c->iov);
+        STATS_LOCK();
+        stats.conn_memory_bytes -= sizeof(conn) + c->rsize + c->wsize + sizeof(item *) * c->isize + sizeof(struct iovec) * c->iovsize + sizeof(struct msghdr) * c->msgsize + sizeof(char *) * c->suffixsize + c->hdrsize * UDP_HEADER_SIZE;
+        stats.conn_structs--;
+        STATS_UNLOCK();
         free(c);
     }
 }
@@ -598,6 +607,10 @@ static void conn_shrink(conn *c) {
         newbuf = (char *)realloc((void *)c->rbuf, DATA_BUFFER_SIZE);
 
         if (newbuf) {
+            STATS_LOCK();
+            stats.conn_memory_bytes -= c->rsize;
+            stats.conn_memory_bytes += DATA_BUFFER_SIZE;
+            STATS_UNLOCK();
             c->rbuf = newbuf;
             c->rsize = DATA_BUFFER_SIZE;
         }
@@ -608,6 +621,10 @@ static void conn_shrink(conn *c) {
     if (c->isize > ITEM_LIST_HIGHWAT) {
         item **newbuf = (item**) realloc((void *)c->ilist, ITEM_LIST_INITIAL * sizeof(c->ilist[0]));
         if (newbuf) {
+            STATS_LOCK();
+            stats.conn_memory_bytes -= sizeof(item *) * c->isize;
+            stats.conn_memory_bytes += sizeof(item *) * ITEM_LIST_INITIAL;
+            STATS_UNLOCK();
             c->ilist = newbuf;
             c->isize = ITEM_LIST_INITIAL;
         }
@@ -617,6 +634,10 @@ static void conn_shrink(conn *c) {
     if (c->msgsize > MSG_LIST_HIGHWAT) {
         struct msghdr *newbuf = (struct msghdr *) realloc((void *)c->msglist, MSG_LIST_INITIAL * sizeof(c->msglist[0]));
         if (newbuf) {
+            STATS_LOCK();
+            stats.conn_memory_bytes -= sizeof(struct msghdr) * c->msgsize;
+            stats.conn_memory_bytes += sizeof(struct msghdr) * MSG_LIST_INITIAL;
+            STATS_UNLOCK();
             c->msglist = newbuf;
             c->msgsize = MSG_LIST_INITIAL;
         }
@@ -626,6 +647,10 @@ static void conn_shrink(conn *c) {
     if (c->iovsize > IOV_LIST_HIGHWAT) {
         struct iovec *newbuf = (struct iovec *) realloc((void *)c->iov, IOV_LIST_INITIAL * sizeof(c->iov[0]));
         if (newbuf) {
+            STATS_LOCK();
+            stats.conn_memory_bytes -= sizeof(struct iovec) * c->iovsize;
+            stats.conn_memory_bytes += sizeof(struct iovec) * IOV_LIST_INITIAL;
+            STATS_UNLOCK();
             c->iov = newbuf;
             c->iovsize = IOV_LIST_INITIAL;
         }
@@ -692,6 +717,10 @@ static int ensure_iov_space(conn *c) {
             STATS_UNLOCK();
             return -1;
         }
+        STATS_LOCK();
+        stats.conn_memory_bytes -= sizeof(struct iovec) * c->iovsize;
+        stats.conn_memory_bytes += (sizeof(struct iovec) * c->iovsize) * 2;
+        STATS_UNLOCK();
         c->iov = new_iov;
         c->iovsize *= 2;
 
@@ -786,6 +815,10 @@ static int build_udp_headers(conn *c) {
             STATS_UNLOCK();
             return -1;
         }
+        STATS_LOCK();
+        stats.conn_memory_bytes -= c->hdrsize * UDP_HEADER_SIZE;
+        stats.conn_memory_bytes += c->hdrsize * UDP_HEADER_SIZE * 2;
+        STATS_UNLOCK();
         c->hdrbuf = (unsigned char *)new_hdrbuf;
         c->hdrsize = c->msgused * 2;
     }
@@ -1604,6 +1637,10 @@ static void bin_read_key(conn *c, enum bin_substates next_substate, int extra) {
             }
 
             c->rbuf= newm;
+            STATS_LOCK();
+            stats.conn_memory_bytes -= c->rsize;
+            stats.conn_memory_bytes += nsize;
+            STATS_UNLOCK();
             /* rcurr should point to the same offset in the packet */
             c->rcurr = c->rbuf + offset - sizeof(protocol_binary_request_header);
             c->rsize = nsize;
@@ -2637,6 +2674,8 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
     }
     APPEND_STAT("malloc_fails", "%llu",
                 (unsigned long long)stats.malloc_fails);
+    APPEND_STAT("conn_memory_bytes", "%llu",
+                (unsigned long long)stats.conn_memory_bytes);
     STATS_UNLOCK();
 }
 
@@ -2780,6 +2819,10 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 if (i >= c->isize) {
                     item **new_list = realloc(c->ilist, sizeof(item *) * c->isize * 2);
                     if (new_list) {
+                        STATS_LOCK();
+                        stats.conn_memory_bytes -= sizeof(item *) * c->isize;
+                        stats.conn_memory_bytes += sizeof(item *) * c->isize * 2;
+                        STATS_UNLOCK();
                         c->isize *= 2;
                         c->ilist = new_list;
                     } else {
@@ -2808,6 +2851,10 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                     char **new_suffix_list = realloc(c->suffixlist,
                                            sizeof(char *) * c->suffixsize * 2);
                     if (new_suffix_list) {
+                        STATS_LOCK();
+                        stats.conn_memory_bytes -= sizeof(char *) * c->suffixsize;
+                        stats.conn_memory_bytes += (sizeof(char *) * c->suffixsize) * 2;
+                        STATS_UNLOCK();
                         c->suffixsize *= 2;
                         c->suffixlist  = new_suffix_list;
                     } else {
@@ -3685,6 +3732,10 @@ static enum try_read_result try_read_network(conn *c) {
                 c->write_and_go = conn_closing;
                 return READ_MEMORY_ERROR;
             }
+            STATS_LOCK();
+            stats.conn_memory_bytes -= c->rsize;
+            stats.conn_memory_bytes += c->rsize * 2;
+            STATS_UNLOCK();
             c->rcurr = c->rbuf = new_rbuf;
             c->rsize *= 2;
         }
