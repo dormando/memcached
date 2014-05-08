@@ -4312,17 +4312,15 @@ static void drive_machine(conn *c) {
             }
             break;
 
+        case conn_closed:
+            /* This possibly only ever happens if you have built against a
+             * broken libevent and event_del fails. */
+            fprintf(stderr, "ERROR: Double closing %d\n", c->sfd);
         case conn_closing:
             if (IS_UDP(c->transport))
                 conn_cleanup(c);
             else
                 conn_close(c);
-            stop = true;
-            break;
-
-        case conn_closed:
-            /* This possibly only ever happens if you have built against a
-             * broken libevent and event_del fails. */
             stop = true;
             break;
 
