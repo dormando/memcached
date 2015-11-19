@@ -1237,6 +1237,7 @@ static void *item_crawler_thread(void *arg) {
     int crawls_persleep = settings.crawls_persleep;
 
     pthread_mutex_lock(&lru_crawler_lock);
+    pthread_cond_signal(&lru_crawler_cond);
     settings.lru_crawler = true;
     if (settings.verbose > 2)
         fprintf(stderr, "Starting LRU crawler background thread\n");
@@ -1344,6 +1345,8 @@ int start_item_crawler_thread(void) {
         pthread_mutex_unlock(&lru_crawler_lock);
         return -1;
     }
+    /* Avoid returning until the crawler has actually started */
+    pthread_cond_wait(&lru_crawler_cond, &lru_crawler_lock);
     pthread_mutex_unlock(&lru_crawler_lock);
 
     return 0;
