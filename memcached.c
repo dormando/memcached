@@ -154,6 +154,7 @@ static enum transmit_result transmit(conn *c);
  * can block the listener via a condition.
  */
 static volatile bool allow_new_conns = true;
+static bool stop_main_loop = false;
 static struct event maxconnsevent;
 static void maxconns_handler(const int fd, const short which, void *arg) {
     struct timeval t = {.tv_sec = 0, .tv_usec = 10000};
@@ -4898,7 +4899,7 @@ static void process_command(conn *c, char *command) {
                     out_string(c, "ERROR failed to start lru crawler thread");
                 }
             } else if ((strcmp(tokens[COMMAND_TOKEN + 1].value, "disable") == 0)) {
-                if (stop_item_crawler_thread() == 0) {
+                if (stop_item_crawler_thread(false) == 0) {
                     out_string(c, "OK");
                 } else {
                     out_string(c, "ERROR failed to stop lru crawler thread");
@@ -6433,6 +6434,11 @@ static void sig_handler(const int sig) {
     exit(EXIT_SUCCESS);
 }
 
+static void sig_usrhandler(const int sig) {
+    printf("USR1 handled: %s.\n", strsignal(sig));
+    stop_main_loop = true;
+}
+
 #ifndef HAVE_SIGIGNORE
 static int sigignore(int sig) {
     struct sigaction sa = { .sa_handler = SIG_IGN, .sa_flags = 0 };
@@ -6714,6 +6720,7 @@ int main (int argc, char **argv) {
     /* handle SIGINT and SIGTERM */
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
+    signal(SIGUSR1, sig_usrhandler);
 
     /* init settings */
     settings_init();
@@ -7651,6 +7658,7 @@ int main (int argc, char **argv) {
     stats_init();
     assoc_init(settings.hashpower_init);
     conn_init();
+    preallocate = true;
     slabs_init(settings.maxbytes, settings.factor, preallocate,
             use_slab_sizes ? slab_sizes : NULL);
 #ifdef EXTSTORE
@@ -7677,9 +7685,9 @@ int main (int argc, char **argv) {
         }
         ext_storage = storage;
         /* page mover algorithm for extstore needs memory prefilled */
-        slabs_prefill_global();
     }
 #endif
+    slabs_prefill_global();
     /*
      * ignore SIGPIPE signals; we can use errno == EPIPE if we
      * need that information
@@ -7817,11 +7825,24 @@ int main (int argc, char **argv) {
     uriencode_init();
 
     /* enter the event loop */
-    if (event_base_loop(main_base, 0) != 0) {
-        retval = EXIT_FAILURE;
+    while (!stop_main_loop) {
+        if (event_base_loop(main_base, EVLOOP_ONCE) != 0) {
+            retval = EXIT_FAILURE;
+            break;
+        }
     }
 
-    stop_assoc_maintenance_thread();
+    fprintf(stderr, "STOPPING\n");
+    stop_threads();
+    int i;
+    // FIXME: make a function callable from threads.c
+    for (i = 0; i < max_fds; i++) {
+        if (conns[i] && conns[i]->state != conn_closed) {
+            conn_close(conns[i]);
+        }
+    }
+    fprintf(stderr, "Closing mmap\n");
+    slabs_mmap_close();
 
     /* remove the PID file if we're a daemon */
     if (do_daemonize)
