@@ -4883,6 +4883,9 @@ static void process_command(conn *c, char *command) {
     } else if (ntokens >= 3 && strcmp(tokens[COMMAND_TOKEN].value, "extstore") == 0) {
         process_extstore_command(c, tokens, ntokens);
 #endif
+    } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "slabs_dump_info") == 0)) {
+        slabs_dump_info();
+        out_string(c, "OK");
     } else {
         if (ntokens >= 2 && strncmp(tokens[ntokens - 2].value, "HTTP/", 5) == 0) {
             conn_set_state(c, conn_closing);

@@ -665,6 +665,77 @@ void slabs_munlock(void) {
     pthread_mutex_unlock(&slabs_lock);
 }
 
+/* DEBUG CODE: WARNING! LOCKS THE CACHE */
+void slabs_dump_info(void) {
+    pthread_mutex_lock(&slabs_lock);
+
+    int i = 1;
+    char buf[2048];
+    FILE *f = fopen("/tmp/slabs_dump_info.txt", "w");
+    if (f == NULL)
+        goto leave;
+
+    // start at 1 (skip global page pool)
+    for (i = 1; i < power_largest; i++) {
+        unsigned int pid;
+        slabclass_t *p = &slabclass[i];
+        if (!p->slabs)
+            continue;
+
+        // dump HEADER
+        fprintf(f, "C %d %u %u %u %u %ld\n",
+                i, p->size, p->perslab, p->sl_curr, p->slabs, p->requested);
+
+        for (pid = 0; pid < p->slabs; pid++) {
+            void *ptr = p->slab_list[pid];
+            unsigned int checked = 0;
+            unsigned int page_remain = settings.slab_page_size;
+
+            while (page_remain > p->size) {
+                // cast chunk to item, write log entry.
+                item *it = (item *)((char *)ptr + checked);
+
+                // dumps everything but the CAS value.
+                // should be able to reconstruct the LRU via pointers and
+                // it_flags.
+                fprintf(f, "I:%d"
+                        " 0x%" PRIxPTR
+                        " 0x%" PRIxPTR
+                        " 0x%" PRIxPTR
+                        " %u %u %d %u %u %u %u %u ",
+                        i,
+                        (uintptr_t) it->next,
+                        (uintptr_t) it->prev,
+                        (uintptr_t) it->h_next,
+                        it->time,
+                        it->exptime,
+                        it->nbytes,
+                        it->refcount,
+                        it->nsuffix,
+                        it->it_flags,
+                        it->slabs_clsid,
+                        it->nkey
+                       );
+                if (it->nkey != 0) {
+                    uriencode(ITEM_key(it), buf, it->nkey, 2048);
+                    fprintf(f, "%s\n", buf);
+                } else {
+                    fprintf(f, "n/a\n");
+                }
+
+                checked += p->size;
+                page_remain -= p->size;
+            }
+
+        }
+    }
+
+leave:
+    if (f != NULL)
+        fclose(f);
+    pthread_mutex_unlock(&slabs_lock);
+}
+
 static pthread_cond_t slab_rebalance_cond = PTHREAD_COND_INITIALIZER;
 static volatile int do_run_slab_thread = 1;
 static volatile int do_run_slab_rebalance_thread = 1;
