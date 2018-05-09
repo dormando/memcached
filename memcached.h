@@ -335,6 +335,14 @@ struct stats_state {
     uint64_t      curr_bytes;
     uint64_t      curr_conns;
     uint64_t      hash_bytes;       /* size used for hash tables */
+    uint64_t      conn_wbuf_bytes;
+    uint64_t      conn_rbuf_bytes;
+    uint64_t      conn_ilist_bytes;
+    uint64_t      conn_msghdr_bytes;
+    uint64_t      conn_slist_bytes;
+    uint64_t      conn_iovlist_bytes;
+    uint64_t      conn_reallocs;
+    uint64_t      conn_shrinks;
     unsigned int  conn_structs;
     unsigned int  reserved_fds;
     unsigned int  hash_power_level; /* Better hope it's not over 9000 */
