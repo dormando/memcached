@@ -733,6 +733,7 @@ void item_stats(ADD_STAT add_stats, void *c) {
         unsigned int age_hot = 0;
         unsigned int age_warm = 0;
         unsigned int lru_size_map[4];
+        uint64_t     lru_sizeb_map[4];
         const char *fmt = "items:%d:%s";
         char key_str[STAT_KEY_LEN];
         char val_str[STAT_VAL_LEN];
@@ -757,6 +758,7 @@ void item_stats(ADD_STAT add_stats, void *c) {
             totals.direct_reclaims += itemstats[i].direct_reclaims;
             size += sizes[i];
             lru_size_map[x] = sizes[i];
+            lru_sizeb_map[x] = sizes_bytes[i];
             if (lru_type_map[x] == COLD_LRU && tails[i] != NULL) {
                 age = current_time - tails[i]->time;
             } else if (lru_type_map[x] == HOT_LRU && tails[i] != NULL) {
@@ -791,6 +793,12 @@ void item_stats(ADD_STAT add_stats, void *c) {
             APPEND_NUM_FMT_STAT(fmt, n, "number_cold", "%u", lru_size_map[2]);
             if (settings.temp_lru) {
                 APPEND_NUM_FMT_STAT(fmt, n, "number_temp", "%u", lru_size_map[3]);
+            }
+            APPEND_NUM_FMT_STAT(fmt, n, "bytes_hot", "%llu", (unsigned long long)lru_sizeb_map[0]);
+            APPEND_NUM_FMT_STAT(fmt, n, "bytes_warm", "%llu", (unsigned long long)lru_sizeb_map[1]);
+            APPEND_NUM_FMT_STAT(fmt, n, "bytes_cold", "%llu", (unsigned long long)lru_sizeb_map[2]);
+            if (settings.temp_lru) {
+                APPEND_NUM_FMT_STAT(fmt, n, "bytes_temp", "%llu", (unsigned long long)lru_sizeb_map[3]);
             }
             APPEND_NUM_FMT_STAT(fmt, n, "age_hot", "%u", age_hot);
             APPEND_NUM_FMT_STAT(fmt, n, "age_warm", "%u", age_warm);
