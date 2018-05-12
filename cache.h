@@ -58,6 +58,8 @@ typedef struct {
     int freetotal;
     /** The current number of free elements */
     int freecurr;
+    /** The total allocated elements */
+    int alloctotal;
     /** The constructor to be called each time we allocate more memory */
     cache_constructor_t* constructor;
     /** The destructor to be called each time before we release memory */

@@ -604,6 +604,10 @@ char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, u
     if (buffer == 0) {
         return NULL;
     }
+    STATS_LOCK();
+    stats_state.conn_cachedump_allocbytes += memlimit;
+    stats_state.conn_cachedump_allocs++;
+    STATS_UNLOCK();
     bufcurr = 0;
 
     while (it != NULL && (limit == 0 || shown < limit)) {

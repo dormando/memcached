@@ -84,6 +84,7 @@ void* do_cache_alloc(cache_t *cache) {
         object = get_object(ret);
     } else {
         object = ret = malloc(cache->bufsize);
+        cache->alloctotal += cache->bufsize;
         if (ret != NULL) {
             object = get_object(ret);
 

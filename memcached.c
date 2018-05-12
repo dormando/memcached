@@ -1831,6 +1831,7 @@ static bool grow_stats_buf(conn *c, size_t needed) {
     if (c->stats.buffer == NULL) {
         nsize = 1024;
         available = c->stats.size = c->stats.offset = 0;
+        stats_state.conn_stats_allocs++;
     }
 
     while (needed > available) {
@@ -1842,6 +1843,10 @@ static bool grow_stats_buf(conn *c, size_t needed) {
     if (nsize != c->stats.size) {
         char *ptr = realloc(c->stats.buffer, nsize);
         if (ptr) {
+            // NOTE: This is fine for this patch, but grow_stats_buf is
+            // sometimes called with the STATS_LOCK held, sometimes without :(
+            // that means the malloc_fail below can deadlock.
+            stats_state.conn_stats_allocbytes += nsize - c->stats.size;
             c->stats.buffer = ptr;
             c->stats.size = nsize;
         } else {
@@ -3204,6 +3209,14 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
     APPEND_STAT("log_worker_written", "%llu", (unsigned long long)stats.log_worker_written);
     APPEND_STAT("log_watcher_skipped", "%llu", (unsigned long long)stats.log_watcher_skipped);
     APPEND_STAT("log_watcher_sent", "%llu", (unsigned long long)stats.log_watcher_sent);
+    APPEND_STAT("conn_thread_scache_bytes", "%llu", (unsigned long long)c->thread->suffix_cache->alloctotal);
+    APPEND_STAT("conn_thread_cqbytes", "%llu", (unsigned long long)stats_state.conn_thread_cqbytes);
+    APPEND_STAT("conn_cachedump_allocbytes", "%llu", (unsigned long long)stats_state.conn_cachedump_allocbytes);
+    APPEND_STAT("conn_cachedump_allocs", "%llu", (unsigned long long)stats_state.conn_cachedump_allocs);
+    APPEND_STAT("conn_stats_allocbytes", "%llu", (unsigned long long)stats_state.conn_stats_allocbytes);
+    APPEND_STAT("conn_stats_allocs", "%llu", (unsigned long long)stats_state.conn_stats_allocs);
+    APPEND_STAT("conn_waf_freed_bytes", "%llu", (unsigned long long)stats_state.conn_waf_freed_bytes);
+    APPEND_STAT("conn_waf_frees", "%llu", (unsigned long long)stats_state.conn_waf_frees);
     APPEND_STAT("conn_struct_bytes", "%llu", (unsigned long long)stats_state.conn_structs * sizeof(conn));
     APPEND_STAT("conn_wbuf_bytes", "%llu", (unsigned long long)stats_state.conn_wbuf_bytes);
     APPEND_STAT("conn_rbuf_bytes", "%llu", (unsigned long long)stats_state.conn_rbuf_bytes);
@@ -3212,7 +3225,7 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
     APPEND_STAT("conn_msghdr_bytes", "%llu", (unsigned long long)stats_state.conn_msghdr_bytes * sizeof(struct msghdr));
     APPEND_STAT("conn_iovlist_bytes", "%llu", (unsigned long long)stats_state.conn_iovlist_bytes * sizeof(struct iovec));
     APPEND_STAT("conn_reallocs", "%llu", (unsigned long long)stats_state.conn_reallocs);
-    APPEND_STAT("conn_reallocs", "%llu", (unsigned long long)stats_state.conn_shrinks);
+    APPEND_STAT("conn_shrinks", "%llu", (unsigned long long)stats_state.conn_shrinks);
     STATS_UNLOCK();
 #ifdef EXTSTORE
     if (c->thread->storage) {
@@ -5737,6 +5750,13 @@ static void drive_machine(conn *c) {
                     }
                 } else if (c->state == conn_write) {
                     if (c->write_and_free) {
+                        STATS_LOCK();
+                        // NOTE: This will be less than the amount allocated,
+                        // since it's only tracking the bytes actually written
+                        // to the wire vs the amount initially malloc'ed :(
+                        stats_state.conn_waf_freed_bytes += c->wbytes;
+                        stats_state.conn_waf_frees++;
+                        STATS_UNLOCK();
                         free(c->write_and_free);
                         c->write_and_free = 0;
                     }

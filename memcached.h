@@ -335,6 +335,13 @@ struct stats_state {
     uint64_t      curr_bytes;
     uint64_t      curr_conns;
     uint64_t      hash_bytes;       /* size used for hash tables */
+    uint64_t      conn_thread_cqbytes;
+    uint64_t      conn_cachedump_allocbytes; // bytes are temporary, counter only incr
+    uint64_t      conn_cachedump_allocs;
+    uint64_t      conn_stats_allocbytes; // bytes are temporary, counter only incr
+    uint64_t      conn_stats_allocs;
+    uint64_t      conn_waf_freed_bytes; // bytes freed by write-and-free
+    uint64_t      conn_waf_frees;
     uint64_t      conn_wbuf_bytes;
     uint64_t      conn_rbuf_bytes;
     uint64_t      conn_ilist_bytes;

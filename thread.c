@@ -249,6 +249,9 @@ static CQ_ITEM *cqi_new(void) {
             STATS_UNLOCK();
             return NULL;
         }
+        STATS_LOCK();
+        stats_state.conn_thread_cqbytes += sizeof(CQ_ITEM) * ITEMS_PER_ALLOC;
+        STATS_UNLOCK();
 
         /*
          * Link together all the new items except the first one
