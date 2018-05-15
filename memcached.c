@@ -752,7 +752,9 @@ static void conn_cleanup(conn *c) {
     conn_release_items(c);
 
     if (c->write_and_free) {
-        free(c->write_and_free);
+        if (!STATS_BUF_FREE((char **)&c->write_and_free)) {
+            free(c->write_and_free);
+        }
         c->write_and_free = 0;
     }
 
@@ -1829,8 +1831,16 @@ static bool grow_stats_buf(conn *c, size_t needed) {
 
     /* Special case: No buffer -- need to allocate fresh */
     if (c->stats.buffer == NULL) {
-        nsize = 1024;
-        available = c->stats.size = c->stats.offset = 0;
+        //nsize = 1024;
+        c->stats.buffer = STATS_BUF_GET(&nsize);
+        if (c->stats.buffer != NULL) {
+            //available = c->stats.size = c->stats.offset = 0;
+            available = nsize;
+            c->stats.size = nsize;
+            c->stats.offset = 0;
+        } else {
+            return false;
+        }
         stats_state.conn_stats_allocs++;
     }
 
@@ -1847,6 +1857,7 @@ static bool grow_stats_buf(conn *c, size_t needed) {
             // sometimes called with the STATS_LOCK held, sometimes without :(
             // that means the malloc_fail below can deadlock.
             stats_state.conn_stats_allocbytes += nsize - c->stats.size;
+            STATS_BUF_GROW(ptr, nsize - c->stats.size);
             c->stats.buffer = ptr;
             c->stats.size = nsize;
         } else {
@@ -5757,7 +5768,9 @@ static void drive_machine(conn *c) {
                         stats_state.conn_waf_freed_bytes += c->wbytes;
                         stats_state.conn_waf_frees++;
                         STATS_UNLOCK();
-                        free(c->write_and_free);
+                        if (!STATS_BUF_FREE((char **)&c->write_and_free)) {
+                            free(c->write_and_free);
+                        }
                         c->write_and_free = 0;
                     }
                     conn_set_state(c, c->write_and_go);

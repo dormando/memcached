@@ -57,6 +57,11 @@ pthread_mutex_t atomics_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* Lock for global stats */
 static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static pthread_mutex_t stats_buf_lock = PTHREAD_MUTEX_INITIALIZER;
+char *stats_global_buf = NULL;
+size_t stats_global_size = 0;
+bool stats_global_inuse = false;
+
 /* Lock to cause worker threads to hang up after being woken */
 static pthread_mutex_t worker_hang_lock;
 
@@ -663,6 +668,40 @@ void STATS_LOCK() {
 
 void STATS_UNLOCK() {
     pthread_mutex_unlock(&stats_lock);
+}
+
+char* STATS_BUF_GET(size_t *size) {
+    if (pthread_mutex_trylock(&stats_buf_lock) != 0) {
+        return NULL;
+    }
+    assert(!stats_global_inuse);
+    if (stats_global_buf == NULL) {
+        stats_global_size = 1024;
+        stats_global_buf = malloc(stats_global_size); // same number as grow_stats_buf init.
+    }
+    stats_global_inuse = true;
+    *size = stats_global_size;
+    return stats_global_buf;
+}
+
+void STATS_BUF_GROW(char *nptr, size_t nsize) {
+    stats_global_buf = nptr;
+    stats_global_size += nsize;
+}
+
+/* HACK: Since write-and-free doesn't know its source, always call this during
+ * WAF and mark the buffer as out of use if it's actually the stats global
+ * buf.
+ */
+bool STATS_BUF_FREE(char **buf) {
+    if (*buf == stats_global_buf) {
+        assert(stats_global_inuse);
+        stats_global_inuse = false;
+        pthread_mutex_unlock(&stats_buf_lock);
+        return true;
+    } else {
+        return false;
+    }
 }
 
 void threadlocal_stats_reset(void) {

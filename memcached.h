@@ -755,6 +755,9 @@ void pause_threads(enum pause_thread_types type);
 #define refcount_decr(it) --(it->refcount)
 void STATS_LOCK(void);
 void STATS_UNLOCK(void);
+char *STATS_BUF_GET(size_t *size);
+bool STATS_BUF_FREE(char **buf);
+void STATS_BUF_GROW(char *nptr, size_t nsize);
 void threadlocal_stats_reset(void);
 void threadlocal_stats_aggregate(struct thread_stats *stats);
 void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out);
