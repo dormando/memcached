@@ -6572,6 +6572,7 @@ int main (int argc, char **argv) {
     int maxcore = 0;
     char *username = NULL;
     char *pid_file = NULL;
+    char *memory_file = NULL;
     struct passwd *pw;
     struct rlimit rlim;
     char *buf;
@@ -6779,6 +6780,7 @@ int main (int argc, char **argv) {
           "S"   /* Sasl ON */
           "F"   /* Disable flush_all */
           "X"   /* Disable dump commands */
+          "e:"  /* mmap path for external item memory */
           "o:"  /* Extended generic options */
           ;
 
@@ -6815,6 +6817,7 @@ int main (int argc, char **argv) {
         {"enable-sasl", no_argument, 0, 'S'},
         {"disable-flush-all", no_argument, 0, 'F'},
         {"disable-dumping", no_argument, 0, 'X'},
+        {"memory-file", required_argument, 0, 'e'},
         {"extended", required_argument, 0, 'o'},
         {0, 0, 0, 0}
     };
@@ -6910,6 +6913,9 @@ int main (int argc, char **argv) {
             break;
         case 'P':
             pid_file = optarg;
+            break;
+        case 'e':
+            memory_file = optarg;
             break;
         case 'f':
             settings.factor = atof(optarg);
@@ -7658,9 +7664,11 @@ int main (int argc, char **argv) {
     stats_init();
     assoc_init(settings.hashpower_init);
     conn_init();
-    preallocate = true;
+    if (memory_file != NULL) {
+        preallocate = true;
+    }
     slabs_init(settings.maxbytes, settings.factor, preallocate,
-            use_slab_sizes ? slab_sizes : NULL);
+            use_slab_sizes ? slab_sizes : NULL, memory_file);
 #ifdef EXTSTORE
     if (storage_file) {
         enum extstore_res eres;
