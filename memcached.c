@@ -4919,6 +4919,9 @@ static void process_command(conn *c, char *command) {
         process_verbosity_command(c, tokens, ntokens);
     } else if (ntokens >= 3 && strcmp(tokens[COMMAND_TOKEN].value, "lru") == 0) {
         process_lru_command(c, tokens, ntokens);
+    } else if ((ntokens == 2) && (strcmp(tokens[COMMAND_TOKEN].value, "force_hashexpand") == 0)) {
+        assoc_force_expand();
+        out_string(c, "OK");
 #ifdef MEMCACHED_DEBUG
     // commands which exist only for testing the memcached's security protection
     } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "misbehave") == 0)) {

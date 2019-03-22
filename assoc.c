@@ -151,6 +151,16 @@ void assoc_start_expand(uint64_t curr_items) {
     }
 }
 
+void assoc_force_expand(void) {
+    if (started_expanding)
+        return;
+
+    if (hashpower < HASHPOWER_MAX) {
+        started_expanding = true;
+        pthread_cond_signal(&maintenance_cond);
+    }
+}
+
 /* Note: this isn't an assoc_update.  The key must not already exist to call this */
 int assoc_insert(item *it, const uint32_t hv) {
     unsigned int oldbucket;
