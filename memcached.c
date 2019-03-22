@@ -7761,7 +7761,7 @@ int main (int argc, char **argv) {
     }
 
     /* create the listening socket, bind it, and init */
-    if (settings.socketpath == NULL) {
+    //if (settings.socketpath == NULL) {
         const char *portnumber_filename = getenv("MEMCACHED_PORT_FILENAME");
         char *temp_portnumber_filename = NULL;
         size_t len;
@@ -7809,7 +7809,7 @@ int main (int argc, char **argv) {
         }
         if (temp_portnumber_filename)
             free(temp_portnumber_filename);
-    }
+    //}
 
     /* Give the sockets a moment to open. I know this is dumb, but the error
      * is only an advisory.
