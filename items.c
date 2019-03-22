@@ -298,7 +298,12 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
         if (it != NULL)
             it->it_flags |= ITEM_CHUNKED;
     } else {
-        it = do_item_alloc_pull(ntotal, id);
+        if (flags != 1) {
+            it = do_item_alloc_pull(ntotal, id);
+        } else {
+            it = calloc(1, ntotal);
+            it->refcount = 1;
+        }
     }
 
     if (it == NULL) {
