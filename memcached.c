@@ -1160,7 +1160,7 @@ static int build_udp_headers(conn *c) {
 }
 
 
-void out_string(conn *c, const char *str) {
+static void out_string(conn *c, const char *str) {
     size_t len;
 
     assert(c != NULL);
@@ -5017,7 +5017,12 @@ static void process_command(conn *c, char *command) {
 #ifdef TLS
     } else if (ntokens == 2 && strcmp(tokens[COMMAND_TOKEN].value, "refresh_certs") == 0) {
         set_noreply_maybe(c, tokens, ntokens);
-        refresh_certs(c);
+        char *errmsg = NULL;
+        if (refresh_certs(&errmsg)) {
+            out_string(c, "OK");
+        } else {
+            write_and_free(c, errmsg, strlen(errmsg));
+        }
         return;
 #endif
     } else {
@@ -6474,7 +6479,7 @@ static void usage(void) {
            "   - ssl_verify_mode:     peer certificate verification mode, default is 0(None).\n"
            "                          valid values are 0(None), 1(Request), 2(Require)\n"
            "                          or 3(Once)\n"
-           "   - ssl_ciphers:          specify cipher list to be used\n"
+           "   - ssl_ciphers:         specify cipher list to be used\n"
            "   - ssl_ca_cert:         PEM format file of acceptable client CA's\n"
            "   - ssl_wbuf_size:       size in kilobytes of per-connection SSL output buffer\n"
 #endif
