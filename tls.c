@@ -104,7 +104,7 @@ static bool load_server_certificates(char **errmsg) {
             settings.ssl_chain_cert);
         success = false;
     } else if (!SSL_CTX_use_PrivateKey_file(settings.ssl_ctx, settings.ssl_key,
-                                        settings.ssl_keyform)) {
+                                        settings.ssl_keyformat)) {
         snprintf(error_msg, errmax, "Error loading the key: %s\r\n", settings.ssl_key);
         success = false;
     } else if (!SSL_CTX_check_private_key(settings.ssl_ctx)) {

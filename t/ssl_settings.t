@@ -23,7 +23,7 @@ is($settings->{'ssl_enabled'}, 'yes');
 is($settings->{'ssl_chain_cert'}, $cert);
 is($settings->{'ssl_key'}, $key);
 is($settings->{'ssl_verify_mode'}, 0);
-is($settings->{'ssl_keyform'}, 1);
+is($settings->{'ssl_keyformat'}, 1);
 is($settings->{'ssl_ciphers'}, 'NULL');
 is($settings->{'ssl_ca_cert'}, 'NULL');
 is($settings->{'ssl_wbuf_size'}, 16384);

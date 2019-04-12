@@ -252,7 +252,7 @@ static void settings_init(void) {
     settings.ssl_chain_cert = NULL;
     settings.ssl_key = NULL;
     settings.ssl_verify_mode = SSL_VERIFY_NONE;
-    settings.ssl_keyform = SSL_FILETYPE_PEM;
+    settings.ssl_keyformat = SSL_FILETYPE_PEM;
     settings.ssl_ciphers = NULL;
     settings.ssl_ca_cert = NULL;
     settings.ssl_last_cert_refresh_time = current_time;
@@ -3370,7 +3370,7 @@ static void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("ssl_chain_cert", "%s", settings.ssl_chain_cert);
     APPEND_STAT("ssl_key", "%s", settings.ssl_key);
     APPEND_STAT("ssl_verify_mode", "%d", settings.ssl_verify_mode);
-    APPEND_STAT("ssl_keyform", "%d", settings.ssl_keyform);
+    APPEND_STAT("ssl_keyformat", "%d", settings.ssl_keyformat);
     APPEND_STAT("ssl_ciphers", "%s", settings.ssl_ciphers ? settings.ssl_ciphers : "NULL");
     APPEND_STAT("ssl_ca_cert", "%s", settings.ssl_ca_cert ? settings.ssl_ca_cert : "NULL");
     APPEND_STAT("ssl_wbuf_size", "%u", settings.ssl_wbuf_size);
@@ -6475,7 +6475,7 @@ static void usage(void) {
 #ifdef TLS
            "   - ssl_chain_cert:      certificate chain file in PEM format\n"
            "   - ssl_key:             private key, if not part of the -ssl_chain_cert\n"
-           "   - ssl_keyform:         private key format (PEM, DER or ENGINE) PEM default\n"
+           "   - ssl_keyformat:         private key format (PEM, DER or ENGINE) PEM default\n"
            "   - ssl_verify_mode:     peer certificate verification mode, default is 0(None).\n"
            "                          valid values are 0(None), 1(Request), 2(Require)\n"
            "                          or 3(Once)\n"
@@ -6877,7 +6877,7 @@ int main (int argc, char **argv) {
         [SSL_CERT] = "ssl_chain_cert",
         [SSL_KEY] = "ssl_key",
         [SSL_VERIFY_MODE] = "ssl_verify_mode",
-        [SSL_KEYFORM] = "ssl_keyform",
+        [SSL_KEYFORM] = "ssl_keyformat",
         [SSL_CIPHERS] = "ssl_ciphers",
         [SSL_CA_CERT] = "ssl_ca_cert",
         [SSL_WBUF_SIZE] = "ssl_wbuf_size",
@@ -7498,11 +7498,11 @@ int main (int argc, char **argv) {
             }
             case SSL_KEYFORM:
                 if (subopts_value == NULL) {
-                    fprintf(stderr, "Missing ssl_keyform argument\n");
+                    fprintf(stderr, "Missing ssl_keyformat argument\n");
                     return 1;
                 }
-                if (!safe_strtol(subopts_value, &settings.ssl_keyform)) {
-                    fprintf(stderr, "could not parse argument to ssl_keyform\n");
+                if (!safe_strtol(subopts_value, &settings.ssl_keyformat)) {
+                    fprintf(stderr, "could not parse argument to ssl_keyformat\n");
                     return 1;
                 }
                 break;
