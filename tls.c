@@ -15,8 +15,6 @@ static pthread_mutex_t ssl_ctx_lock = PTHREAD_MUTEX_INITIALIZER;
 
 const unsigned MAX_ERROR_MSG_SIZE = 128;
 
-#define MIN(a,b) (((a)<(b))?(a):(b))
-
 void SSL_LOCK() {
     pthread_mutex_lock(&(ssl_ctx_lock));
 }
@@ -42,11 +40,10 @@ ssize_t ssl_read(conn *c, void *buf, size_t count) {
  */
 ssize_t ssl_sendmsg(conn *c, struct msghdr *msg, int flags) {
     assert (c != NULL);
-    size_t bytes, to_copy;
+    size_t buf_remain = settings.ssl_wbuf_size;
+    size_t bytes = 0;
+    size_t to_copy;
     int i;
-    bytes = 0;
-    for (i = 0; i < msg->msg_iovlen; ++i)
-        bytes += msg->msg_iov[i].iov_len;
 
     // ssl_wbuf is pointing to the buffer allocated in the worker thread.
     assert(c->ssl_wbuf);
@@ -58,15 +55,15 @@ ssize_t ssl_sendmsg(conn *c, struct msghdr *msg, int flags) {
     // than the one it's assigned.
     assert(c->thread->thread_id == (unsigned long)pthread_self());
 
-    bytes = MIN(bytes, settings.ssl_wbuf_size);
-    to_copy = bytes;
     char *bp = c->ssl_wbuf;
-    for (i = 0; i < msg->msg_iovlen; ++i) {
-        size_t copy = MIN (to_copy, msg->msg_iov[i].iov_len);
-        memcpy((void*)bp, (void*)msg->msg_iov[i].iov_base, copy);
-        bp +=  copy;
-        to_copy -= copy;
-        if (to_copy == 0)
+    for (i = 0; i < msg->msg_iovlen; i++) {
+        size_t len = msg->msg_iov[i].iov_len;
+        to_copy = len < buf_remain ? len : buf_remain;
+
+        memcpy(bp + bytes, (void*)msg->msg_iov[i].iov_base, to_copy);
+        buf_remain -= to_copy;
+        bytes += to_copy;
+        if (buf_remain == 0)
             break;
     }
     /* TODO : document the state machine interactions for SSL_write with
