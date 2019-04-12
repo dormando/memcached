@@ -6139,7 +6139,7 @@ static int server_sockets(int port, enum network_transport transport,
     bool ssl_enabled = false;
 
 #ifdef TLS
-    const char *notls ="notls";
+    const char *notls = "notls";
     ssl_enabled = settings.ssl_enabled;
 #endif
 
