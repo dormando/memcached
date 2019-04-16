@@ -1,7 +1,6 @@
 package MemcachedTest;
 use strict;
 use IO::Socket::INET;
-use IO::Socket::SSL;
 use IO::Socket::UNIX;
 use Exporter 'import';
 use Carp qw(croak);
@@ -31,6 +30,7 @@ my $client_key = $testdir. CLIENT_KEY;
 my $server_crt = $testdir . SRV_CRT;
 my $server_key = $testdir . SRV_KEY;
 
+my $tls_checked = 0;
 
 sub sleep {
     my $n = shift;
@@ -165,11 +165,13 @@ sub free_port {
     while (!$sock) {
         $port = int(rand(20000)) + 30000;
         if (enabled_tls_testing()) {
-            $sock = IO::Socket::SSL->new(LocalAddr => '127.0.0.1',
+            $sock = eval qq{ IO::Socket::SSL->new(LocalAddr => '127.0.0.1',
                                       LocalPort => $port,
-                                      Proto     => $type,
+                                      Proto     => '$type',
                                       ReuseAddr => 1,
                                       SSL_verify_mode => SSL_VERIFY_NONE);
+                                      };
+             die $@ if $@; # sanity check.
         } else {
             $sock = IO::Socket::INET->new(LocalAddr => '127.0.0.1',
                                       LocalPort => $port,
@@ -205,7 +207,14 @@ sub supports_tls {
 }
 
 sub enabled_tls_testing {
-    return supports_tls() && $ENV{SSL_TEST};
+    if ($tls_checked) {
+        return 1;
+    } elsif (supports_tls() && $ENV{SSL_TEST}) {
+        eval "use IO::Socket::SSL";
+        croak("IO::Socket::SSL not installed or failed to load, cannot run SSL tests as requested") if $@;
+        $tls_checked = 1;
+        return 1;
+    }
 }
 
 sub supports_drop_priv {
@@ -224,10 +233,12 @@ sub new_memcached {
         my ($host, $port) = ($ENV{T_MEMD_USE_DAEMON} =~ m/^([^:]+):(\d+)$/);
         my $conn;
         if ($ssl_enabled) {
-            $conn = IO::Socket::SSL->new(PeerAddr => "$host:$port",
+            $conn = eval qq{IO::Socket::SSL->new(PeerAddr => "$host:$port",
                                         SSL_verify_mode => SSL_VERIFY_NONE,
-                                        SSL_cert_file => $client_crt,
-                                        SSL_key_file => $client_key);
+                                        SSL_cert_file => '$client_crt',
+                                        SSL_key_file => '$client_key');
+                                        };
+             die $@ if $@; # sanity check.
         } else {
             $conn = IO::Socket::INET->new(PeerAddr => "$host:$port");
         }
@@ -295,10 +306,12 @@ sub new_memcached {
     for (1..20) {
         my $conn;
         if ($ssl_enabled) {
-            $conn = IO::Socket::SSL->new(PeerAddr => "127.0.0.1:$port",
+            $conn = eval qq{ IO::Socket::SSL->new(PeerAddr => "127.0.0.1:$port",
                                         SSL_verify_mode => SSL_VERIFY_NONE,
-                                        SSL_cert_file => $client_crt,
-                                        SSL_key_file => $client_key);
+                                        SSL_cert_file => '$client_crt',
+                                        SSL_key_file => '$client_key');
+                                        };
+            die $@ if $@; # sanity check.
         } else {
             $conn = IO::Socket::INET->new(PeerAddr => "127.0.0.1:$port");
         }
@@ -355,10 +368,11 @@ sub new_sock {
     if ($self->{domainsocket}) {
         return IO::Socket::UNIX->new(Peer => $self->{domainsocket});
     } elsif (MemcachedTest::enabled_tls_testing()) {
-        return IO::Socket::SSL->new(PeerAddr => "$self->{host}:$self->{port}",
+        return eval qq{ IO::Socket::SSL->new(PeerAddr => "$self->{host}:$self->{port}",
                                     SSL_verify_mode => IO::Socket::SSL::SSL_VERIFY_NONE,
-                                    SSL_cert_file => $client_crt,
-                                    SSL_key_file => $client_key);
+                                    SSL_cert_file => '$client_crt',
+                                    SSL_key_file => '$client_key');
+                                    };
     } else {
         return IO::Socket::INET->new(PeerAddr => "$self->{host}:$self->{port}");
     }
