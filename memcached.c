@@ -597,6 +597,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c->sasl_started = false;
     c->set_stale = false;
     c->mset_res = false;
+    c->close_after_write = false;
     c->last_cmd_time = current_time; /* initialize for idle kicker */
 #ifdef EXTSTORE
     c->io_wraplist = NULL;
@@ -1117,8 +1118,6 @@ static void out_string(conn *c, const char *str) {
     // rbytes is done or we yield.
     // I think it's right to bounce through conn_new_cmd.
     conn_set_state(c, conn_new_cmd);
-    // TODO: do we still need this?
-    resp->write_and_go = conn_new_cmd;
     return;
 }
 
@@ -1399,17 +1398,15 @@ static void write_bin_error(conn *c, protocol_binary_response_status err,
 
     len = strlen(errstr);
     add_bin_header(c, err, 0, 0, len);
-    mc_resp *resp = c->resp;
     if (len > 0) {
         // FIXME: I broke it.
         //add_iov(c, errstr, len);
     }
-    conn_set_state(c, conn_mwrite);
-    if(swallow > 0) {
+    if (swallow > 0) {
         c->sbytes = swallow;
-        resp->write_and_go = conn_swallow;
+        conn_set_state(c, conn_swallow);
     } else {
-        resp->write_and_go = conn_new_cmd;
+        conn_set_state(c, conn_mwrite);
     }
 }
 
@@ -1420,14 +1417,11 @@ static void write_bin_response(conn *c, void *d, int hlen, int keylen, int dlen)
         add_bin_header(c, 0, hlen, keylen, dlen);
         mc_resp *resp = c->resp;
         if (dlen > 0) {
-            // FIXME: I broke it.
-            //add_iov(c, d, dlen);
+            resp_add_iov(resp, d, dlen);
         }
-        conn_set_state(c, conn_mwrite);
-        resp->write_and_go = conn_new_cmd;
-    } else {
-        conn_set_state(c, conn_new_cmd);
     }
+
+    conn_set_state(c, conn_new_cmd);
 }
 
 static void complete_incr_bin(conn *c) {
@@ -1620,8 +1614,7 @@ static void write_bin_miss_response(conn *c, char *key, size_t nkey) {
         memcpy(ofs, key, nkey);
         // FIXME: adjust wbytes I think?
         //add_iov(c, ofs, nkey);
-        conn_set_state(c, conn_mwrite);
-        c->resp->write_and_go = conn_new_cmd;
+        conn_set_state(c, conn_new_cmd);
     } else {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT,
                         NULL, 0);
@@ -1726,8 +1719,7 @@ static void process_bin_get_or_touch(conn *c) {
         }
 
         if (!failed) {
-            conn_set_state(c, conn_mwrite);
-            c->resp->write_and_go = conn_new_cmd;
+            conn_set_state(c, conn_new_cmd);
             /* Remember this command so we can garbage collect it later */
 #ifdef EXTSTORE
             if ((it->it_flags & ITEM_HDR) != 0 && should_return_value) {
@@ -2015,7 +2007,7 @@ static void handle_binary_protocol_error(conn *c) {
         fprintf(stderr, "Protocol error (opcode %02x), close connection %d\n",
                 c->binary_header.request.opcode, c->sfd);
     }
-    c->resp->write_and_go = conn_closing;
+    c->close_after_write = true;
 }
 
 static void init_sasl_conn(conn *c) {
@@ -2086,7 +2078,7 @@ static void process_bin_sasl_auth(conn *c) {
 
     if (nkey > MAX_SASL_MECH_LEN) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, vlen);
-        c->resp->write_and_go = conn_swallow;
+        conn_set_state(c, conn_swallow);
         return;
     }
 
@@ -2098,7 +2090,7 @@ static void process_bin_sasl_auth(conn *c) {
     /* Can't use a chunked item for SASL authentication. */
     if (it == 0 || (it->it_flags & ITEM_CHUNKED)) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, NULL, vlen);
-        c->resp->write_and_go = conn_swallow;
+        conn_set_state(c, conn_swallow);
         return;
     }
 
@@ -2122,7 +2114,7 @@ static void process_bin_complete_sasl_auth(conn *c) {
 
     if (nkey > ((item*) c->item)->nkey) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, vlen);
-        c->resp->write_and_go = conn_swallow;
+        conn_set_state(c, conn_swallow);
         item_unlink(c->item);
         return;
     }
@@ -2138,7 +2130,7 @@ static void process_bin_complete_sasl_auth(conn *c) {
 
     if (vlen > ((item*) c->item)->nbytes) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, vlen);
-        c->resp->write_and_go = conn_swallow;
+        conn_set_state(c, conn_swallow);
         item_unlink(c->item);
         return;
     }
@@ -2191,11 +2183,12 @@ static void process_bin_complete_sasl_auth(conn *c) {
         break;
     case SASL_CONTINUE:
         add_bin_header(c, PROTOCOL_BINARY_RESPONSE_AUTH_CONTINUE, 0, 0, outlen);
-        if(outlen > 0) {
+        if (outlen > 0) {
+            // FIXME: do things.
             //add_iov(c, out, outlen);
         }
+        // Immediately flush our write.
         conn_set_state(c, conn_mwrite);
-        c->resp->write_and_go = conn_new_cmd;
         break;
     default:
         if (settings.verbose)
@@ -2240,13 +2233,13 @@ static void dispatch_bin_command(conn *c) {
 
     if (keylen > bodylen || keylen + extlen > bodylen) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_UNKNOWN_COMMAND, NULL, 0);
-        c->resp->write_and_go = conn_closing;
+        c->close_after_write = true;
         return;
     }
 
     if (settings.sasl && !authenticated(c)) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_AUTH_ERROR, NULL, 0);
-        c->resp->write_and_go = conn_closing;
+        c->close_after_write = true;
         return;
     }
 
@@ -2380,9 +2373,10 @@ static void dispatch_bin_command(conn *c) {
         case PROTOCOL_BINARY_CMD_QUIT:
             if (keylen == 0 && extlen == 0 && bodylen == 0) {
                 write_bin_response(c, NULL, 0, 0, 0);
-                c->resp->write_and_go = conn_closing;
                 if (c->noreply) {
                     conn_set_state(c, conn_closing);
+                } else {
+                    c->close_after_write = true;
                 }
             } else {
                 protocol_error = 1;
@@ -2493,7 +2487,7 @@ static void process_bin_update(conn *c) {
         }
 
         /* swallow the data line */
-        c->resp->write_and_go = conn_swallow;
+        conn_set_state(c, conn_swallow);
         return;
     }
 
@@ -2563,7 +2557,7 @@ static void process_bin_append_prepend(conn *c) {
             c->sbytes = vlen;
         }
         /* swallow the data line */
-        c->resp->write_and_go = conn_swallow;
+        conn_set_state(c, conn_swallow);
         return;
     }
 
@@ -3072,7 +3066,6 @@ static void write_and_free(conn *c, char *buf, int bytes) {
         resp->write_and_free = buf;
         resp_add_iov(resp, buf, bytes);
         conn_set_state(c, conn_new_cmd);
-        resp->write_and_go = conn_new_cmd;
     } else {
         out_of_memory(c, "SERVER_ERROR out of memory writing stats");
     }
@@ -4138,8 +4131,7 @@ static void process_meta_command(conn *c, token_t *tokens, const size_t ntokens)
         item_remove(it);
         resp->wbytes = total + ret;
         resp_add_iov(resp, resp->wbuf, resp->wbytes);
-        conn_set_state(c, conn_mwrite);
-        resp->write_and_go = conn_new_cmd;
+        conn_set_state(c, conn_new_cmd);
     } else {
         out_string(c, "EN");
     }
@@ -4561,8 +4553,7 @@ static void process_mget_command(conn *c, token_t *tokens, const size_t ntokens)
         }
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
-        conn_set_state(c, conn_mwrite);
-        resp->write_and_go = conn_new_cmd;
+        conn_set_state(c, conn_new_cmd);
     } else {
         pthread_mutex_lock(&c->thread->stats.mutex);
         if (ttl_set) {
@@ -6235,7 +6226,7 @@ static enum try_read_result try_read_network(conn *c) {
                 }
                 c->rbytes = 0; /* ignore what we read */
                 out_of_memory(c, "SERVER_ERROR out of memory reading request");
-                c->resp->write_and_go = conn_closing;
+                c->close_after_write = true;
                 return READ_MEMORY_ERROR;
             }
             c->rcurr = c->rbuf = new_rbuf;
@@ -6863,11 +6854,12 @@ static void drive_machine(conn *c) {
             switch (transmit(c)) {
             case TRANSMIT_COMPLETE:
                 if (c->state == conn_mwrite) {
+                    // Free up IO wraps and any half-uploaded items.
                     conn_release_items(c);
-                    // FIXME: def not right.
                     conn_set_state(c, conn_new_cmd);
-                    // TODO: nuke this. write_and_free() goes into the free
-                    // resp routine.
+                    if (c->close_after_write) {
+                        conn_set_state(c, conn_closing);
+                    }
                 } else {
                     if (settings.verbose > 0)
                         fprintf(stderr, "Unexpected state %d\n", c->state);
