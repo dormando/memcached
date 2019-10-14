@@ -644,7 +644,6 @@ typedef struct _mc_resp {
     struct sockaddr_in6 request_addr; /* udp: Who sent this request */
     socklen_t request_addr_size;
 
-    // TODO: separate? not always needed, but mostly needed.
     char wbuf[WRITE_BUFFER_SIZE];
 } mc_resp;
 
