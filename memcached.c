@@ -1966,6 +1966,9 @@ static void process_bin_sasl_auth(conn *c) {
     if (it == 0 || (it->it_flags & ITEM_CHUNKED)) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, NULL, vlen);
         conn_set_state(c, conn_swallow);
+        if (it) {
+            do_item_remove(it);
+        }
         return;
     }
 
@@ -1990,7 +1993,6 @@ static void process_bin_complete_sasl_auth(conn *c) {
     if (nkey > ((item*) c->item)->nkey) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, vlen);
         conn_set_state(c, conn_swallow);
-        item_unlink(c->item);
         return;
     }
 
@@ -2006,7 +2008,6 @@ static void process_bin_complete_sasl_auth(conn *c) {
     if (vlen > ((item*) c->item)->nbytes) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, vlen);
         conn_set_state(c, conn_swallow);
-        item_unlink(c->item);
         return;
     }
 
@@ -2041,8 +2042,6 @@ static void process_bin_complete_sasl_auth(conn *c) {
         }
         break;
     }
-
-    item_unlink(c->item);
 
     if (settings.verbose) {
         fprintf(stderr, "sasl result code:  %d\n", result);
@@ -2585,6 +2584,10 @@ static void complete_nread_binary(conn *c) {
         break;
     case bin_reading_sasl_auth_data:
         process_bin_complete_sasl_auth(c);
+        if (c->item) {
+            do_item_remove(c->item);
+            c->item = NULL;
+        }
         break;
     default:
         fprintf(stderr, "Not handling substate %d\n", c->substate);
@@ -2597,6 +2600,7 @@ static void reset_cmd_handler(conn *c) {
     c->substate = bin_no_state;
     if (c->item != NULL) {
         // FIXME: what route was requiring this?
+        // SASL auth was mistakening using it.
         fprintf(stderr, "WHY AM I HERE!?!?!?\n");
         abort();
         item_remove(c->item);
