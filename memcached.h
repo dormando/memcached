@@ -315,6 +315,8 @@ struct thread_stats {
     uint64_t response_obj_bytes;
     uint64_t response_obj_total;
     uint64_t response_obj_free;
+    uint64_t read_buf_bytes;
+    uint64_t read_buf_bytes_free;
 };
 
 /**

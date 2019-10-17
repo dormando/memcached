@@ -3037,6 +3037,8 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
     APPEND_STAT("response_obj_bytes", "%llu", (unsigned long long)thread_stats.response_obj_bytes);
     APPEND_STAT("response_obj_total", "%llu", (unsigned long long)thread_stats.response_obj_total);
     APPEND_STAT("response_obj_free", "%llu", (unsigned long long)thread_stats.response_obj_free);
+    APPEND_STAT("read_buf_bytes", "%llu", (unsigned long long)thread_stats.read_buf_bytes);
+    APPEND_STAT("read_buf_bytes_free", "%llu", (unsigned long long)thread_stats.read_buf_bytes_free);
     APPEND_STAT("reserved_fds", "%u", stats_state.reserved_fds);
     APPEND_STAT("cmd_get", "%llu", (unsigned long long)thread_stats.get_cmds);
     APPEND_STAT("cmd_set", "%llu", (unsigned long long)slab_stats.set_cmds);
