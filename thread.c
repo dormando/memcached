@@ -412,6 +412,13 @@ static void setup_thread(LIBEVENT_THREAD *me) {
         fprintf(stderr, "Failed to create response cache\n");
         exit(EXIT_FAILURE);
     }
+
+    me->rbuf_cache = cache_create("rbuf", READ_BUFFER_SIZE, sizeof(char *), NULL, NULL);
+    if (me->rbuf_cache == NULL) {
+        fprintf(stderr, "Failed to create read buffer cache\n");
+        exit(EXIT_FAILURE);
+    }
+
 #ifdef EXTSTORE
     me->io_cache = cache_create("io", sizeof(io_wrap), sizeof(char*), NULL, NULL);
     if (me->io_cache == NULL) {
