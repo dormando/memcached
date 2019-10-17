@@ -829,6 +829,8 @@ void threadlocal_stats_aggregate(struct thread_stats *stats) {
         stats->response_obj_bytes += threads[ii].resp_cache->total * sizeof(mc_resp);
         stats->response_obj_total += threads[ii].resp_cache->total;
         stats->response_obj_free += threads[ii].resp_cache->freecurr;
+        stats->read_buf_bytes += threads[ii].rbuf_cache->total * READ_BUFFER_SIZE;
+        stats->read_buf_bytes_free += threads[ii].rbuf_cache->freecurr * READ_BUFFER_SIZE;
         pthread_mutex_unlock(&threads[ii].stats.mutex);
     }
 }
