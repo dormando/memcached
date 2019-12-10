@@ -857,3 +857,6 @@ extern void drop_worker_privileges(void);
 
 #define likely(x)       __builtin_expect((x),1)
 #define unlikely(x)     __builtin_expect((x),0)
+
+typedef void *(*memset_def)(void *s, int c, size_t n);
+memset_def memset_func;

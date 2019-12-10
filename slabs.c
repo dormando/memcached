@@ -222,6 +222,8 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
         if (mem_base != NULL) {
             mem_current = mem_base;
             mem_avail = mem_limit;
+            // Force all memory to be paged in now.
+            memset_func(mem_base, 0, mem_limit);
         } else {
             fprintf(stderr, "Warning: Failed to allocate requested memory in"
                     " one large chunk.\nWill allocate in smaller chunks\n");
@@ -599,6 +601,12 @@ static void *memory_allocate(size_t size) {
     if (mem_base == NULL) {
         /* We are not using a preallocated large memory chunk */
         ret = malloc(size);
+        // FIXME: this may not be the right place for this check, since the
+        // one caller to memory_allocate() is also checking it.
+        if (ret != NULL) {
+            // Force memory to be paged in now.
+            memset_func(ret, 0, size);
+        }
     } else {
         ret = mem_current;
 
@@ -738,6 +746,12 @@ static int slab_rebalance_start(void) {
     if (s_cls->slabs < 2)
         no_go = -3;
 
+    // Bit-vector to keep track of completed chunks
+    slab_rebal.completed = (uint8_t*)calloc(s_cls->perslab,sizeof(uint8_t));
+    if (slab_rebal.completed == NULL) {
+        no_go = -4;
+    }
+
     if (no_go != 0) {
         pthread_mutex_unlock(&slabs_lock);
         return no_go; /* Should use a wrapper function... */
@@ -755,9 +769,6 @@ static int slab_rebalance_start(void) {
     if (slab_rebal.s_clsid == SLAB_GLOBAL_PAGE_POOL) {
         slab_rebal.done = 1;
     }
-
-    // Bit-vector to keep track of completed chunks
-    slab_rebal.completed = (uint8_t*)calloc(s_cls->perslab,sizeof(uint8_t));
 
     slab_rebalance_signal = 2;
 

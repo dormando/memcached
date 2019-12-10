@@ -59,11 +59,14 @@ void assoc_init(const int hashtable_init) {
     if (hashtable_init) {
         hashpower = hashtable_init;
     }
-    primary_hashtable = calloc(hashsize(hashpower), sizeof(void *));
+    size_t size = hashsize(hashpower) * sizeof(void *);
+    primary_hashtable = malloc(size);
     if (! primary_hashtable) {
         fprintf(stderr, "Failed to init hashtable.\n");
         exit(EXIT_FAILURE);
     }
+    // force allocation of memory pages.
+    memset_func(primary_hashtable, 0, size);
     STATS_LOCK();
     stats_state.hash_power_level = hashpower;
     stats_state.hash_bytes = hashsize(hashpower) * sizeof(void *);
@@ -121,10 +124,13 @@ static item** _hashitem_before (const char *key, const size_t nkey, const uint32
 static void assoc_expand(void) {
     old_hashtable = primary_hashtable;
 
-    primary_hashtable = calloc(hashsize(hashpower + 1), sizeof(void *));
+    size_t size = hashsize(hashpower + 1) * sizeof(void *);
+    primary_hashtable = malloc(size);
     if (primary_hashtable) {
         if (settings.verbose > 1)
             fprintf(stderr, "Hash table expansion starting\n");
+        // force allocation of memory pages.
+        memset(primary_hashtable, 0, size);
         hashpower++;
         expanding = true;
         expand_bucket = 0;

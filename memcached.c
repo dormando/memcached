@@ -8227,6 +8227,8 @@ int main (int argc, char **argv) {
     bool use_slab_sizes = false;
     char *slab_sizes_unparsed = NULL;
     bool slab_chunk_size_changed = false;
+    // create an un-optimiziable indirect memset...
+    memset_func = memset;
     // struct for restart code. Initialized up here so we can curry
     // important settings to save or validate.
     struct _mc_meta_data *meta = malloc(sizeof(struct _mc_meta_data));

@@ -262,9 +262,13 @@ static int storage_compact_check(void *storage, logger *l,
     rate = 1.0 - ((double)st.pages_free / st.page_count);
     rate *= settings.ext_max_frag;
     frag_limit = st.page_size * rate;
+    st.page_data = calloc(st.page_count, sizeof(struct extstore_page_data));
+    // assume temporary failure on alloc fail.
+    if (st.page_data == NULL) {
+        return 0;
+    }
     LOGGER_LOG(l, LOG_SYSEVENTS, LOGGER_COMPACT_FRAGINFO,
             NULL, rate, frag_limit);
-    st.page_data = calloc(st.page_count, sizeof(struct extstore_page_data));
     extstore_get_page_data(storage, &st);
 
     // find oldest page by version that violates the constraint
