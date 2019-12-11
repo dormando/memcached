@@ -991,7 +991,8 @@ static void resp_add_chunked_iov(mc_resp *resp, const void *buf, int len) {
 // _per worker thread_ limit of response objects.
 #define RESPONSE_OBJECT_LIMIT 1000
 static bool resp_start(conn *c) {
-    if (c->thread->resp_cache->total >= RESPONSE_OBJECT_LIMIT) {
+    if (c->thread->resp_cache->total >= RESPONSE_OBJECT_LIMIT
+            && c->thread->resp_cache->freecurr == 0) {
         return false;
     }
     mc_resp *resp = do_cache_alloc(c->thread->resp_cache);
