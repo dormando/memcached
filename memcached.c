@@ -840,6 +840,13 @@ static void conn_release_items(conn *c) {
         while (resp) {
             resp = resp_finish(c, resp);
         }
+
+        if (c->resp_head != NULL && c->resp != NULL) {
+            //stop_main_loop = true;
+            fprintf(stderr, "ERROR: FINISHED RELEASING ITEMS BUT RESP_HEAD AND RESP ARE NON NULL: [%d] [%s]\n", c->sfd,
+                    c->protocol == binary_prot ? "binary" : "ascii");
+
+        }
     }
 }
 
@@ -1024,6 +1031,14 @@ static bool resp_start(conn *c) {
 
 // returns next response in chain.
 static mc_resp* resp_finish(conn *c, mc_resp *resp) {
+    if (resp->free == true) {
+        // ERROR: critical double free detected.
+        stop_main_loop = true;
+        fprintf(stderr, "FATAL: DOUBLE FREE DETECTED FOR CONNECTION: [%d] [%s]\n", c->sfd,
+                c->protocol == binary_prot ? "binary" : "ascii");
+        // returning a NULL will cut the close loop short.
+        return NULL;
+    }
     mc_resp *next = resp->next;
     if (resp->item) {
         // TODO: cache hash value in resp obj?
@@ -1035,10 +1050,15 @@ static mc_resp* resp_finish(conn *c, mc_resp *resp) {
     }
     if (c->resp_head == resp) {
         c->resp_head = next;
+    } else {
+        // don't think this is fatal, but it is a thing that shouldn't happen.
+        fprintf(stderr, "ERROR: RESPONSE OBJECT TO FREE IS NOT RESPONSE HEAD: [%d] [%s]\n", c->sfd,
+                c->protocol == binary_prot ? "binary" : "ascii");
     }
     if (c->resp == resp) {
         c->resp = NULL;
     }
+    resp->free = true;
     do_cache_free(c->thread->resp_cache, resp);
     return next;
 }
@@ -9674,6 +9694,12 @@ int main (int argc, char **argv) {
             conn_close(conns[i]);
         }
     }
+
+    // WARNING: NOT A PERMANENT CHANGE.
+    // attempt to generate a core file after closing out connections in hopes
+    // of avoiding a memory explosion.
+    abort();
+
     if (memory_file != NULL) {
         restart_mmap_close();
     }
