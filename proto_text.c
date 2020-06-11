@@ -15,11 +15,6 @@
 
 static void process_command(conn *c, char *command);
 
-typedef struct token_s {
-    char *value;
-    size_t length;
-} token_t;
-
 /*
  * we get here after reading the value in set/add/replace commands. The command
  * has been stored in c->cmd, and the item is ready in c->item.
@@ -156,12 +151,6 @@ void complete_nread_ascii(conn *c) {
     c->item = 0;
 }
 
-#define COMMAND_TOKEN 0
-#define SUBCOMMAND_TOKEN 1
-#define KEY_TOKEN 1
-
-#define MAX_TOKENS 24
-
 #define WANT_TOKENS(ntokens, min, max) \
     do { \
         if ((min != -1 && ntokens < min) || (max != -1 && ntokens > max)) { \
@@ -203,7 +192,7 @@ void complete_nread_ascii(conn *c) {
  *      command  = tokens[ix].value;
  *   }
  */
-static size_t tokenize_command(char *command, token_t *tokens, const size_t max_tokens) {
+size_t tokenize_command(char *command, token_t *tokens, const size_t max_tokens) {
     char *s, *e;
     size_t ntokens = 0;
     size_t len = strlen(command);

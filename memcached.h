@@ -490,6 +490,10 @@ struct settings {
 #endif
     int num_napi_ids;   /* maximum number of NAPI IDs */
     char *memory_file;  /* warm restart memory file path */
+#ifdef PROXY
+    bool proxy_enabled;
+    char *proxy_startfile; /* lua file to run when workers start */
+#endif
 };
 
 extern struct stats stats;
@@ -631,7 +635,11 @@ typedef struct {
     char   *ssl_wbuf;
 #endif
     int napi_id;                /* napi id associated with this thread */
-
+#ifdef PROXY
+    void *L;
+    int proxy_hook; // TODO: temporary, probably unused.
+    int proxy_attach_ref; // TODO: temporary single callback value :)
+#endif
 } LIBEVENT_THREAD;
 
 /**
@@ -681,6 +689,7 @@ typedef struct conn conn;
 
 #define IO_QUEUE_NONE 0
 #define IO_QUEUE_EXTSTORE 1
+#define IO_QUEUE_PROXY 2
 
 typedef void (*io_queue_stack_cb)(void *ctx, void *stack);
 typedef void (*io_queue_cb)(io_pending_t *pending);

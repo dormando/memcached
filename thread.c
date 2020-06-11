@@ -6,6 +6,9 @@
 #ifdef EXTSTORE
 #include "storage.h"
 #endif
+#ifdef PROXY
+#include "proto_proxy.h"
+#endif
 #include <assert.h>
 #include <stdio.h>
 #include <errno.h>
@@ -455,6 +458,13 @@ static void setup_thread(LIBEVENT_THREAD *me) {
         }
     }
 #endif
+#ifdef PROXY
+    // TODO: maybe register hooks to be called here from sub-packages? ie;
+    // extstore, TLS, proxy.
+    if (settings.proxy_enabled) {
+        proxy_thread_init(me);
+    }
+#endif
 }
 
 /*
@@ -541,6 +551,10 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
                         conn_io_queue_add(c, IO_QUEUE_EXTSTORE, c->thread->storage,
                             storage_submit_cb, storage_complete_cb, storage_finalize_cb);
                     }
+#endif
+#ifdef PROXY
+                    conn_io_queue_add(c, IO_QUEUE_PROXY, NULL, proxy_submit_cb,
+                            proxy_complete_cb, proxy_finalize_cb);
 #endif
                     conn_io_queue_add(c, IO_QUEUE_NONE, NULL, NULL, NULL, NULL);
 

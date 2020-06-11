@@ -56,6 +56,7 @@
 
 #include "proto_text.h"
 #include "proto_bin.h"
+#include "proto_proxy.h"
 
 #if defined(__FreeBSD__)
 #include <sys/sysctl.h>
@@ -2249,7 +2250,9 @@ static int try_read_command_negotiate(conn *c) {
     } else {
         // authentication doesn't work with negotiated protocol.
         c->protocol = ascii_prot;
-        c->try_read_command = try_read_command_ascii;
+        // FIXME: temp!
+        //c->try_read_command = try_read_command_ascii;
+        c->try_read_command = try_read_command_proxy;
     }
 
     if (settings.verbose > 1) {
@@ -4661,6 +4664,11 @@ int main (int argc, char **argv) {
         fprintf(stderr, "failed to allocate extstore config\n");
         return 1;
     }
+#endif
+#ifdef PROXY
+    // FIXME: real start options.
+    settings.proxy_enabled = true;
+    settings.proxy_startfile = "startfile.lua";
 #endif
 
     /* Run regardless of initializing it later */
