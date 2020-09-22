@@ -18,6 +18,9 @@
 // FIXME: do include dir properly.
 #include "vendor/mcmc/mcmc.h"
 
+#define ENDSTR "END\r\n"
+#define ENDLEN sizeof(ENDSTR)-1
+
 #define MCP_THREAD_UPVALUE 1
 #define MCP_ATTACH_UPVALUE 2
 
@@ -134,6 +137,7 @@ static void proxy_server_handler(const int fd, const short which, void *arg) {
         while (p) {
             // hold the next ptr because we lose access to *p
             io_pending_proxy_t *next_p = p->server_next;
+            mcmc_resp_t tmp_resp; // helper for testing for GET's END marker.
             if (s->req_stack_tail == p) {
                 assert(next_p == NULL);
                 s->req_stack_tail = NULL;
@@ -150,21 +154,24 @@ static void proxy_server_handler(const int fd, const short which, void *arg) {
             // we actually don't care about anything other than the value length
             // for now.
             // TODO: if vlen != vlen_read, pull an item and copy the data.
+            int extra_space = 0;
             switch (r->resp.type) {
                 case MCMC_RESP_GET:
-                    // TODO: we're in GET mode. need to find/tack the END\r\n on?
-                    // another possibility: we keep creating response objects here
-                    // and chain them?
-                    res = 0;
+                    // We're in GET mode. we only support one key per
+                    // GET in the proxy backends, so we need to later check
+                    // for an END.
+                    extra_space = ENDLEN;
                     break;
                 case MCMC_RESP_END:
-                    // end of a get chain.
-                    res = 0;
+                    // this is a MISS from a GET request
+                    // or final handler from a STAT request.
+                    assert(r->resp.vlen == 0);
                     break;
                 case MCMC_RESP_META:
                     // we can handle meta responses easily since they're self
                     // contained.
                     break;
+                // TODO: No-op response?
                 default:
                     // unhandled :(
                     // TODO: set the status code properly?
@@ -176,7 +183,7 @@ static void proxy_server_handler(const int fd, const short which, void *arg) {
             if (res) {
                 // r->resp.reslen + r->resp.vlen is the total length of the response.
                 // TODO: need to associate a buffer with this response...
-                // for now lets above write_and_free on mc_resp and simply malloc the
+                // for now lets abuse write_and_free on mc_resp and simply malloc the
                 // space we need, stuffing it into the resp object.
                 // how will lua be able to generate a fake response tho?
                 // TODO: if item is large enough (or not fully read), allocate
@@ -184,13 +191,48 @@ static void proxy_server_handler(const int fd, const short which, void *arg) {
                 // need to stop and re-schedule the event if not enough data.
 
                 size_t tlen = r->resp.reslen + r->resp.vlen;
-                char *buf = malloc(tlen);
+                char *buf = malloc(tlen + extra_space);
                 // TODO: check buf. but also avoid the malloc things.
                 memcpy(buf, s->rbuf, tlen);
                 r->buf = buf;
                 r->blen = tlen;
             } else {
                 // TODO: no response read?
+            }
+
+            int remain = 0;
+            char *newbuf = NULL;
+            // Check the type again in case we need to do post-processing, or
+            // loop.
+            switch (r->resp.type) {
+                case MCMC_RESP_GET:
+                    // we need to advance the buffer and ensure the next data
+                    // in the stream is "END\r\n"
+                    // if not, the stack is desynced and we lose it.
+                    newbuf = mcmc_buffer_consume(s->client, &remain);
+
+                    if (remain > ENDLEN) {
+                        // enough bytes in the buffer for our potential END
+                        // marker, so lets avoid an unnecessary memmove.
+                    } else if (remain != 0) {
+                        memmove(s->rbuf, newbuf, remain);
+                        newbuf = s->rbuf;
+                    }
+
+                    if (mcmc_read(s->client, newbuf, READ_BUFFER_SIZE-remain, &tmp_resp) != MCMC_OK) {
+                        // TODO: something?
+                    } else if (tmp_resp.type != MCMC_RESP_END) {
+                        // TODO: protocol is desynced, need to dump queue.
+                    } else {
+                        // response is good.
+                        // FIXME: copy what the server actually sent?
+                        memcpy(r->buf+r->blen, ENDSTR, ENDLEN);
+                        r->blen += 5;
+                    }
+
+                    break;
+                default:
+                    break;
             }
 
             // have to do the c->io_pending-- and == 0 and redispatch_conn()
@@ -208,12 +250,11 @@ static void proxy_server_handler(const int fd, const short which, void *arg) {
             // IO's.
             // if no more data in buffer, need to re-set stack head and re-set
             // event.
-            int remain = 0;
-            char *newbuf = mcmc_buffer_consume(s->client, &remain);
+            remain = 0;
+            newbuf = mcmc_buffer_consume(s->client, &remain);
             if (remain != 0) {
                 // data trailing in the buffer, for a different request.
                 memmove(s->rbuf, newbuf, remain);
-                fprintf(stderr, "DATA TRAILING IN RESPONSE BUFFER\n");
             } else {
                 break;
             }
