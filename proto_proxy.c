@@ -27,6 +27,7 @@
 static void process_proxy_command(conn *c, char *command, size_t cmdlen);
 static void dump_stack(lua_State *L);
 static void mcp_queue_io(conn *c, lua_State *l, lua_State *Lc);
+static void proxy_server_handler(const int fd, const short which, void *arg);
 
 typedef uint32_t (*hash_selector_func)(const void *key, size_t len);
 typedef struct {
@@ -49,6 +50,8 @@ typedef struct {
     io_pending_proxy_t *req_stack_tail;
     char *rbuf; // TODO: from thread's rbuf cache.
     struct event event; // libevent
+    bool connecting; // in the process of an asynch connection.
+    bool can_write; // recently got a WANT_WRITE or are connecting.
 } mcp_server_t;
 
 typedef struct {
@@ -74,6 +77,7 @@ struct _io_pending_proxy_t {
     const char *req; // request string
     size_t reqlen; // real length of the request
     mcp_resp_t *client_resp; // reference (currently pointing to a lua object)
+    bool flushed; // whether we've fully written this request to a backend.
 };
 
 // -------------- EXTERNAL FUNCTIONS
@@ -119,14 +123,55 @@ void proxy_thread_init(LIBEVENT_THREAD *thr) {
     }
 }
 
+static void _flush_pending_writes(mcp_server_t *s) {
+    io_pending_proxy_t *p = s->req_stack_head;
+
+    // Told to check queue with nothing in it; connect-ahead?
+    if (p == NULL) {
+        return;
+    }
+    int flags = EV_TIMEOUT;
+    // TODO: since this is worker-inline only, we're pulling the event base
+    // from the requests. when bg pool owns servers this will change.
+    struct timeval tmp_time = {5,0}; // FIXME: temporary hard coded response timeout.
+    struct event_base *base = NULL;
+
+    while (p) {
+        io_pending_proxy_t *next_p = p->server_next;
+        base = p->c->thread->base;
+        if (!p->flushed) {
+            int status = mcmc_send_request(s->client, p->req, p->reqlen, 1);
+
+            if (status == MCMC_WANT_WRITE) {
+                s->can_write = false; // not necessary but for consistency.
+                flags |= EV_WRITE;
+                return; // can't continue for now.
+            } else if (status != MCMC_OK) {
+                // TODO: error propagation.
+                return;
+            }
+
+            flags |= EV_READ;
+        }
+
+        p = next_p;
+    }
+
+    // set the event.
+    // FIXME: function.
+    if (event_initialized(&s->event) == 0 || event_pending(&s->event, EV_READ|EV_WRITE, NULL) == 0) {
+        event_assign(&s->event, base, mcmc_fd(s->client),
+                flags, proxy_server_handler, s);
+        event_add(&s->event, &tmp_time);
+    }
+
+}
+
 // The libevent callback handler.
 static void proxy_server_handler(const int fd, const short which, void *arg) {
     mcp_server_t *s = arg;
 
-    // TODO: What should we do when multiple events fire at once?
-    if (which & EV_TIMEOUT) {
-        // TODO: walk stack and set timeout status on each object.
-    } else if (which & EV_READ) {
+    if (which & EV_READ) {
         // FIXME: get the buffer from thread?
         if (s->rbuf == NULL) {
             s->rbuf = malloc(READ_BUFFER_SIZE);
@@ -148,7 +193,7 @@ static void proxy_server_handler(const int fd, const short which, void *arg) {
             r->status = mcmc_read(s->client, s->rbuf, READ_BUFFER_SIZE, &r->resp);
             if (r->status != MCMC_OK) {
                 // TODO: ??? reduce io_pending and break?
-                // check for WANT_READ and re-add the event?
+                // TODO: check for WANT_READ and re-add the event.
             }
 
             // we actually don't care about anything other than the value length
@@ -261,9 +306,31 @@ static void proxy_server_handler(const int fd, const short which, void *arg) {
         }
         s->req_stack_head = p;
         // TODO: need to re-add the read event if the stack isn't NULL
-    } else if (which & EV_WRITE) {
+    }
+
+    // allow dequeuing anything ready to be read before we process EV_TIMEOUT;
+    // though it might not be possible for both to fire.
+    if (which & EV_TIMEOUT) {
+        // TODO: walk stack and set timeout status on each object.
+        // then return.
+    }
+
+    if (which & EV_WRITE) {
+        s->can_write = true;
+        if (s->connecting) {
+            int err = 0;
+            // We were connecting, now ensure we're properly connected.
+            if (mcmc_check_nonblock_connect(s->client, &err) != MCMC_OK) {
+                // TODO: for now we kill the stack. need to retry a few times
+                // first.
+                // TODO: will need a mechanism for max retries, waits between
+                // fast-fails, and failing the stack equivalent to a timeout.
+            }
+
+        }
         // TODO: walk stack until we've flushed everything.
         // need indicators on written amounts.
+        _flush_pending_writes(s);
     }
 
 }
@@ -285,18 +352,29 @@ void proxy_submit_cb(void *ctx, void *ctx_stack) {
 
     while (p) {
         mcp_server_t *s = p->server;
-        // TODO: check for connected, reconnect if necessary.
-        int status = mcmc_send_request(s->client, p->req, p->reqlen, 1);
 
-        // TODO: real error propagation.
-        // should just need to mark the request as done, io_pending--, etc.
-        if (status != MCMC_OK) {
-            fprintf(stderr, "Failed to send request to memcached: %s:%s\n", s->ip, s->port);
-            return;
+        // If we're not in the process of connecting, we can immediately issue
+        // the request.
+        if (s->can_write) {
+            // TODO: check for connected, reconnect if necessary.
+            int status = mcmc_send_request(s->client, p->req, p->reqlen, 1);
+
+            if (status == MCMC_WANT_WRITE) {
+                // avoid syscalls for any other queued requests.
+                s->can_write = false;
+                // s->client is tracking the amount of data already sent on
+                // this request. we need to call it again with the same
+                // arguments later.
+            } else if (status != MCMC_OK) {
+                // TODO: real error propagation.
+                // should just need to mark the request as done, io_pending--, etc.
+                fprintf(stderr, "Failed to send request to memcached: %s:%s\n", s->ip, s->port);
+                // FIXME: p = p->next; continue; ?
+                return;
+            } else {
+                p->flushed = true;
+            }
         }
-
-        // TODO: with async mode, need to check for MCMC_WANTWRITE/etc and
-        // wait properly.
 
         // FIXME: chicken and egg.
         // can't check if pending if the structure is was calloc'ed (sigh)
@@ -304,8 +382,13 @@ void proxy_submit_cb(void *ctx, void *ctx_stack) {
         // not add anything during initialization, but need the owner thread's
         // event base.
         if (event_initialized(&s->event) == 0 || event_pending(&s->event, EV_READ|EV_WRITE, NULL) == 0) {
+            // if we can't write, we could be connecting.
+            // TODO: always checking for READ in case some commands were sent
+            // successfully. The flags could be tracked on *s and reset in the
+            // handler, perhaps?
+            int flags = s->can_write ? EV_READ|EV_TIMEOUT : EV_READ|EV_WRITE|EV_TIMEOUT;
             event_assign(&s->event, p->c->thread->base, mcmc_fd(s->client),
-                    EV_READ|EV_TIMEOUT, proxy_server_handler, s);
+                    flags, proxy_server_handler, s);
             event_add(&s->event, &tmp_time);
         }
 
@@ -603,6 +686,7 @@ static void mcp_queue_io(conn *c, lua_State *L, lua_State *Lc) {
     p->c = c;
     p->resp = resp;
     p->client_resp = r;
+    p->flushed = false;
     resp->io_pending = (io_pending_t *)p;
 
     // top of the main thread should be our coroutine.
@@ -684,6 +768,8 @@ static int mcplib_server(lua_State *L) {
     s->rbuf = NULL;
     s->req_stack_head = NULL;
     s->req_stack_tail = NULL;
+    s->connecting = false;
+    s->can_write = false;
 
     // initialize libevent.
     memset(&s->event, 0, sizeof(s->event));
@@ -692,9 +778,18 @@ static int mcplib_server(lua_State *L) {
     s->client = malloc(mcmc_size(MCMC_OPTION_BLANK));
     // TODO: connect elsewhere? Any reason not to immediately shoot off a
     // connect?
-    int status = mcmc_connect(s->client, s->ip, s->port, MCMC_OPTION_BLANK);
-    if (status != MCMC_CONNECTED) {
+    int status = mcmc_connect(s->client, s->ip, s->port, MCMC_OPTION_NONBLOCK);
+    if (status == MCMC_CONNECTED) {
+        // FIXME: is this possible? do we ever want to allow blocking
+        // connections?
+        fprintf(stderr, "Unexpectedly connected to backend early: %s:%s\n", s->ip, s->port);
+        // FIXME: propagate error.
+    } else if (status == MCMC_CONNECTING) {
+        s->connecting = true;
+        s->can_write = false;
+    } else {
         fprintf(stderr, "Failed to connect to memcached: %s:%s\n", s->ip, s->port);
+        // FIXME: propagate error.
     }
 
     luaL_getmetatable(L, "mcp.server");
