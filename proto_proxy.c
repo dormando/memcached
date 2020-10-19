@@ -237,8 +237,26 @@ static void proxy_server_handler(const int fd, const short which, void *arg) {
 
                 size_t tlen = r->resp.reslen + r->resp.vlen;
                 char *buf = malloc(tlen + extra_space);
-                // TODO: check buf. but also avoid the malloc things.
-                memcpy(buf, s->rbuf, tlen);
+                // TODO: check buf. but also avoid the malloc via slab alloc.
+
+                if (r->resp.vlen == r->resp.vlen_read) {
+                    // TODO: some mcmc func for pulling the whole buffer?
+                    memcpy(buf, s->rbuf, tlen);
+                } else {
+                    // TODO: mcmc func for pulling the res off the buffer?
+                    memcpy(buf, s->rbuf, r->resp.reslen);
+                    // got a partial read on the value, pull in the rest.
+                    int read = 0;
+                    int status = mcmc_read_value(s->client, buf+r->resp.reslen, r->resp.vlen, &read);
+                    if (status == MCMC_OK) {
+                        // all done copying data.
+                    } else if (status == MCMC_WANT_READ) {
+                        // TODO: remember *buf and &read's offsets.
+                        // TODO: stream larger values' chunks?
+                    } else {
+                        // TODO: error handling.
+                    }
+                }
                 r->buf = buf;
                 r->blen = tlen;
             } else {
@@ -280,12 +298,12 @@ static void proxy_server_handler(const int fd, const short which, void *arg) {
                     break;
             }
 
-            // have to do the c->io_pending-- and == 0 and redispatch_conn()
+            // have to do the q->count-- and == 0 and redispatch_conn()
             // stuff here. The moment we call that write we
             // don't own *p anymore.
             // FIXME: io_pending needs a lock.
-            p->c->io_pending--;
-            if (p->c->io_pending == 0) {
+            p->q->count--;
+            if (p->q->count == 0) {
                 redispatch_conn(p->c);
             }
             // set the p here. if we break below the head will be correct.
@@ -708,8 +726,7 @@ static void mcp_queue_io(conn *c, lua_State *L, lua_State *Lc) {
     // link into the batch chain.
     p->next = q->stack_ctx;
     q->stack_ctx = p;
-    // FIXME: need a lock around io_pending.
-    c->io_pending++;
+    q->count++;
 
     return;
 }
