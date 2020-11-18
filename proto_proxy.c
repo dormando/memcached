@@ -67,7 +67,8 @@ typedef struct {
     int status; // status code from mcmc_read()
     item *it; // for buffering large responses.
     char *buf; // response line + potentially value.
-    size_t blen;
+    size_t blen; // total size of the value to read.
+    int bread; // amount of bytes read into value so far.
 } mcp_resp_t;
 
 // re-cast an io_pending_t into this more descriptive structure.
@@ -137,20 +138,23 @@ void proxy_thread_init(LIBEVENT_THREAD *thr) {
 // issue: want read back to read_end as necessary. special state?
 //   - it's fine: p->client_resp->type.
 // - mcp_server_next: advance, consume, etc.
-static void proxy_server_drive_machine(mcp_server_t *s) {
+static int proxy_server_drive_machine(mcp_server_t *s) {
     bool stop = false;
     io_pending_proxy_t *p = NULL;
     mcmc_resp_t tmp_resp; // helper for testing for GET's END marker.
+    int flags = 0;
 
     while (!stop) {
         mcp_resp_t *r;
         int res = 1;
         int remain = 0;
+        int status = 0;
         char *newbuf = NULL;
 
     switch(s->state) {
         case mcp_server_read:
             p = s->req_stack_head;
+            assert(p != NULL);
             // FIXME: get the buffer from thread?
             if (s->rbuf == NULL) {
                 s->rbuf = malloc(READ_BUFFER_SIZE);
@@ -203,35 +207,32 @@ static void proxy_server_drive_machine(mcp_server_t *s) {
                 // an item and copy into it or try an immediate read.
                 // need to stop and re-schedule the event if not enough data.
 
-                size_t tlen = r->resp.reslen + r->resp.vlen;
-                char *buf = malloc(tlen + extra_space);
+                r->blen = r->resp.reslen + r->resp.vlen;
+                r->buf = malloc(r->blen + extra_space);
                 // TODO: check buf. but also avoid the malloc via slab alloc.
 
                 if (r->resp.vlen == r->resp.vlen_read) {
                     // TODO: some mcmc func for pulling the whole buffer?
-                    memcpy(buf, s->rbuf, tlen);
+                    memcpy(r->buf, s->rbuf, r->blen);
                 } else {
                     // TODO: mcmc func for pulling the res off the buffer?
-                    memcpy(buf, s->rbuf, r->resp.reslen);
+                    memcpy(r->buf, s->rbuf, r->resp.reslen);
                     // got a partial read on the value, pull in the rest.
-                    int read = 0;
-                    int status = mcmc_read_value(s->client, buf+r->resp.reslen, r->resp.vlen, &read);
+                    r->bread = 0;
+                    status = mcmc_read_value(s->client, r->buf+r->resp.reslen, r->resp.vlen, &r->bread);
                     if (status == MCMC_OK) {
                         // all done copying data.
                     } else if (status == MCMC_WANT_READ) {
-                        // TODO: need to store buf, +read offset,
-                        // then set libevent for EV_READ and go back to
-                        // waiting.
-                        // ALSO: check for resuming a read, since we don't
-                        // want to do the top level read in that case.
-                        // or is this an entirely different function?
+                        // need to retry later.
+                        s->state = mcp_server_want_read;
+                        flags |= EV_READ;
+                        stop = true;
+                        break;
                         // TODO: stream larger values' chunks?
                     } else {
                         // TODO: error handling.
                     }
                 }
-                r->buf = buf;
-                r->blen = tlen;
             } else {
                 // TODO: no response read?
             }
@@ -275,7 +276,25 @@ static void proxy_server_drive_machine(mcp_server_t *s) {
 
             break;
         case mcp_server_want_read:
-            // TODO: fill data and continue (to read_end or next)
+            // Continuing a read from earlier
+            p = s->req_stack_head;
+            r = p->client_resp;
+            status = mcmc_read_value(s->client, r->buf+r->resp.reslen, r->resp.vlen, &r->bread);
+            if (status == MCMC_OK) {
+                // all done copying data.
+                if (r->resp.type == MCMC_RESP_GET) {
+                    s->state = mcp_server_read_end;
+                } else {
+                    s->state = mcp_server_next;
+                }
+            } else if (status == MCMC_WANT_READ) {
+                // need to retry later.
+                flags |= EV_READ;
+                stop = true;
+            } else {
+                // TODO: error handling.
+            }
+
             break;
         case mcp_server_next:
             // set the head here. when we break the head will be correct.
@@ -283,6 +302,8 @@ static void proxy_server_drive_machine(mcp_server_t *s) {
             if (s->req_stack_tail == p) {
                 // TODO: suspicious of this code. audit harder?
                 s->req_stack_tail = NULL;
+                stop = true;
+                assert(s->req_stack_head == NULL);
             }
 
             // have to do the q->count-- and == 0 and redispatch_conn()
@@ -298,6 +319,7 @@ static void proxy_server_drive_machine(mcp_server_t *s) {
             // if no more data in buffer, need to re-set stack head and re-set
             // event.
             remain = 0;
+            // TODO: do we need to yield every N reads?
             newbuf = mcmc_buffer_consume(s->client, &remain);
             if (remain != 0) {
                 // data trailing in the buffer, for a different request.
@@ -316,27 +338,23 @@ static void proxy_server_drive_machine(mcp_server_t *s) {
     } // switch
     } // while
 
+    return flags;
 }
 
 // TODO: this function is incomplete:
 // - doesn't set ->flushed
 // - error propagation
-static void _flush_pending_writes(mcp_server_t *s) {
+static int _flush_pending_writes(mcp_server_t *s) {
     io_pending_proxy_t *p = s->req_stack_head;
+    int flags = 0;
 
     // Told to check queue with nothing in it; connect-ahead?
     if (p == NULL) {
-        return;
+        return 0;
     }
-    int flags = EV_TIMEOUT;
-    // TODO: since this is worker-inline only, we're pulling the event base
-    // from the requests. when bg pool owns servers this will change.
-    struct timeval tmp_time = {5,0}; // FIXME: temporary hard coded response timeout.
-    struct event_base *base = NULL;
 
     while (p) {
         io_pending_proxy_t *next_p = p->server_next;
-        base = p->c->thread->base;
         if (!p->flushed) {
             int status = mcmc_send_request(s->client, p->req, p->reqlen, 1);
 
@@ -346,7 +364,7 @@ static void _flush_pending_writes(mcp_server_t *s) {
                 break; // can't continue for now.
             } else if (status != MCMC_OK) {
                 // TODO: error propagation.
-                return;
+                return 0;
             } else {
                 p->flushed = true;
             }
@@ -357,22 +375,19 @@ static void _flush_pending_writes(mcp_server_t *s) {
         p = next_p;
     }
 
-    // set the event.
-    // FIXME: function.
-    if (event_initialized(&s->event) == 0 || event_pending(&s->event, EV_READ|EV_WRITE, NULL) == 0) {
-        event_assign(&s->event, base, mcmc_fd(s->client),
-                flags, proxy_server_handler, s);
-        event_add(&s->event, &tmp_time);
-    }
-
+    return flags;
 }
 
 // The libevent callback handler.
 static void proxy_server_handler(const int fd, const short which, void *arg) {
     mcp_server_t *s = arg;
+    int flags = EV_TIMEOUT;
+    // TODO: since this is worker-inline only, we're pulling the event base
+    // from the requests. when bg pool owns servers this will change.
+    struct timeval tmp_time = {5,0}; // FIXME: temporary hard coded response timeout.
 
     if (which & EV_READ) {
-        proxy_server_drive_machine(s);
+        flags |= proxy_server_drive_machine(s);
         // TODO: need to re-add the read event if the stack isn't NULL
     }
 
@@ -398,7 +413,23 @@ static void proxy_server_handler(const int fd, const short which, void *arg) {
         }
         // TODO: walk stack until we've flushed everything.
         // need indicators on written amounts.
-        _flush_pending_writes(s);
+        flags |= _flush_pending_writes(s);
+    }
+
+    // Still pending requests to read or write.
+    // TODO: as noted above, we're pulling the event base from a random
+    // connection and reusing it, as this work is currently done inline with
+    // the worker always.
+    // the base should be copied to the server object which should be future
+    // proof.
+    // TODO: need to handle errors from above so we don't go to sleep here.
+    if (s->req_stack_head != NULL) {
+        // set the event.
+        if (event_initialized(&s->event) == 0 || event_pending(&s->event, EV_READ|EV_WRITE, NULL) == 0) {
+            event_assign(&s->event, s->req_stack_head->c->thread->base, mcmc_fd(s->client),
+                    flags, proxy_server_handler, s);
+            event_add(&s->event, &tmp_time);
+        }
     }
 
 }
