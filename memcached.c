@@ -2250,9 +2250,12 @@ static int try_read_command_negotiate(conn *c) {
     } else {
         // authentication doesn't work with negotiated protocol.
         c->protocol = ascii_prot;
-        // FIXME: temp!
-        //c->try_read_command = try_read_command_ascii;
-        c->try_read_command = try_read_command_proxy;
+        // FIXME: when proxy is enabled binprot also needs to be disabled.
+        if (settings.proxy_enabled) {
+            c->try_read_command = try_read_command_proxy;
+        } else {
+            c->try_read_command = try_read_command_ascii;
+        }
     }
 
     if (settings.verbose > 1) {
@@ -4583,6 +4586,9 @@ int main (int argc, char **argv) {
         SSL_WBUF_SIZE,
         SSL_SESSION_CACHE,
 #endif
+#ifdef PROXY
+        PROXY_CONFIG,
+#endif
 #ifdef MEMCACHED_DEBUG
         RELAXED_PRIVILEGES,
 #endif
@@ -4636,6 +4642,9 @@ int main (int argc, char **argv) {
         [SSL_WBUF_SIZE] = "ssl_wbuf_size",
         [SSL_SESSION_CACHE] = "ssl_session_cache",
 #endif
+#ifdef PROXY
+        [PROXY_CONFIG] = "proxy_config",
+#endif
 #ifdef MEMCACHED_DEBUG
         [RELAXED_PRIVILEGES] = "relaxed_privileges",
 #endif
@@ -4664,11 +4673,6 @@ int main (int argc, char **argv) {
         fprintf(stderr, "failed to allocate extstore config\n");
         return 1;
     }
-#endif
-#ifdef PROXY
-    // FIXME: real start options.
-    settings.proxy_enabled = true;
-    settings.proxy_startfile = "startfile.lua";
 #endif
 
     /* Run regardless of initializing it later */
@@ -5350,6 +5354,16 @@ int main (int argc, char **argv) {
                 }
                 settings.read_buf_mem_limit *= 1024 * 1024; /* megabytes */
                 break;
+#ifdef PROXY
+            case PROXY_CONFIG:
+                if (subopts_value == NULL) {
+                    fprintf(stderr, "Missing proxy_config file argument\n");
+                    return 1;
+                }
+                settings.proxy_startfile = strdup(subopts_value);
+                settings.proxy_enabled = true;
+                break;
+#endif
 #ifdef MEMCACHED_DEBUG
             case RELAXED_PRIVILEGES:
                 settings.relaxed_privileges = true;
