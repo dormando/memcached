@@ -256,12 +256,16 @@ static int proxy_server_drive_machine(mcp_server_t *s) {
                 // enough bytes in the buffer for our potential END
                 // marker, so lets avoid an unnecessary memmove.
             } else if (remain != 0) {
+                // TODO: don't necessarily need to shovel the buffer.
                 memmove(s->rbuf, newbuf, remain);
+                newbuf = s->rbuf;
+            } else {
                 newbuf = s->rbuf;
             }
 
             // TODO: WANT_READ can happen here.
-            if (mcmc_read(s->client, newbuf, READ_BUFFER_SIZE-remain, &tmp_resp) != MCMC_OK) {
+            status = mcmc_read(s->client, newbuf, READ_BUFFER_SIZE-remain, &tmp_resp);
+            if (status != MCMC_OK) {
                 // TODO: something?
             } else if (tmp_resp.type != MCMC_RESP_END) {
                 // TODO: protocol is desynced, need to dump queue.
