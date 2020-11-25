@@ -27,6 +27,7 @@
 static void process_proxy_command(conn *c, char *command, size_t cmdlen);
 static void dump_stack(lua_State *L);
 static void mcp_queue_io(conn *c, lua_State *l, lua_State *Lc);
+static int mcp_new_request(lua_State *L, char *command, size_t cmdlen);
 static void proxy_server_handler(const int fd, const short which, void *arg);
 
 typedef uint32_t (*hash_selector_func)(const void *key, size_t len);
@@ -44,6 +45,16 @@ enum mcp_server_states {
     mcp_server_want_read, // read more data to complete command
     mcp_server_next, // advance to the next IO
 };
+
+#define MAX_REQ_TOKENS 2
+typedef struct {
+    char *request; // original whole string command.
+    size_t reqlen; // length of command. no null-byte.
+    token_t tokens[MAX_REQ_TOKENS]; // command and key
+    size_t ntokens;
+    int command; // numeric rep of the command from the request.
+    bool lua_key; // if we've pushed the key to lua.
+} mcp_request_t;
 
 // TODO: array of clients based on connection limit.
 #define MAX_IPLEN 45
@@ -710,7 +721,10 @@ static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
     // TODO: we ship the raw request string to lua. Once the API is figured
     // out this should be C bits instead so we can reuse memory.
     // FIXME: do we have to push this before chopping the \r\n?
-    lua_pushlstring(Lc, command, cmdlen);
+    //lua_pushlstring(Lc, command, cmdlen);
+    // FIXME: think we need to parse the request before looking at attach, so
+    // we can attach to specific commands properly?
+    mcp_new_request(Lc, command, cmdlen);
 
     // call the function via coroutine.
     int cores = lua_resume(Lc, NULL, 1, &nresults);
@@ -764,9 +778,13 @@ static void mcp_queue_io(conn *c, lua_State *L, lua_State *Lc) {
     mcp_server_t *s = luaL_checkudata(Lc, -1, "mcp.server");
 
     // Then the request object.
-    luaL_checktype(Lc, -2, LUA_TTABLE);
-    size_t reqlen = 0;
-    const char *req = luaL_tolstring(Lc, -2, &reqlen);
+    mcp_request_t *rq = luaL_checkudata(Lc, -2, "mcp.request");
+    //luaL_checktype(Lc, -2, LUA_TTABLE);
+    //size_t reqlen = 0;
+    //const char *req = luaL_tolstring(Lc, -2, &reqlen);
+    // FIXME: need to check for "if request modified" and recreate it.
+    size_t reqlen = rq->reqlen;
+    const char *req = rq->request;
 
     // Then we push a response object, which we'll re-use later.
     // reserve one uservalue for a lua-supplied response.
@@ -958,6 +976,7 @@ static int mcplib_hash_selector(lua_State *L) {
 static int mcplib_hash_selector_call(lua_State *L) {
     // internal args are the hash selector (self)
     mcp_hash_selector_t *ss = luaL_checkudata(L, -2, "mcp.hash_selector");
+    /*
     // then the request object (table)
     luaL_checktype(L, -1, LUA_TTABLE);
 
@@ -975,10 +994,15 @@ static int mcplib_hash_selector_call(lua_State *L) {
     // top of stack should be the key now.
     size_t len = 0;
     const char *key = lua_tolstring(L, -1, &len);
+    */
+    mcp_request_t *rq = luaL_checkudata(L, -1, "mcp.request");
 
+    // we have a fast path to the key/length.
+    char *key = rq->tokens[KEY_TOKEN].value;
+    size_t len = rq->tokens[KEY_TOKEN].length;
     uint32_t hash = ss->func(key, len);
     int ref = ss->pool[hash % ss->pool_size].ref;
-    lua_pop(L, 1); // pop the key. top should now be request again.
+    //lua_pop(L, 1); // pop the key. top should now be request again.
 
     // put the selected server onto the stack.
     lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
@@ -1018,26 +1042,204 @@ static int mcplib_attach(lua_State *L) {
 }
 
 // TODO: temporary defines.
-// should we call these MCP_* and fix them up in the register function?
-#define MCP_OK 0
-#define REQUEST_ANY 1
-#define REQUEST_GET 2
-#define REQUEST_SET 3
-#define REQUEST_DELETE 4
+#define CMD_FIELDS \
+    X(CMD_MG) \
+    X(CMD_MS) \
+    X(CMD_MD) \
+    X(CMD_MN) \
+    X(CMD_MA) \
+    X(CMD_ME) \
+    X(CMD_GET) \
+    X(CMD_GAT) \
+    X(CMD_SET) \
+    X(CMD_ADD) \
+    X(CMD_CAS) \
+    X(CMD_LRU) \
+    X(CMD_GETS) \
+    X(CMD_GATS) \
+    X(CMD_INCR) \
+    X(CMD_DECR) \
+    X(CMD_QUIT) \
+    X(CMD_STATS) \
+    X(CMD_SLABS) \
+    X(CMD_TOUCH) \
+    X(CMD_WATCH) \
+    X(CMD_APPEND) \
+    X(CMD_DELETE) \
+    X(CMD_REPLACE) \
+    X(CMD_PREPEND) \
+    X(CMD_VERSION) \
+    X(CMD_SHUTDOWN) \
+    X(CMD_EXTSTORE) \
+    X(CMD_FLUSH_ALL) \
+    X(CMD_VERBOSITY) \
+    X(CMD_LRU_CRAWLER) \
+    X(CMD_REFRESH_CERTS) \
+    X(CMD_CACHE_MEMLIMIT)
+
+#define X(name) name,
+enum proxy_defines {
+    P_OK = 0,
+    CMD_ANY,
+    CMD_FIELDS
+};
+#undef X
 
 static void proxy_register_defines(lua_State *L) {
-#define MCP_D(x) \
+#define X(x) \
     lua_pushinteger(L, x); \
     lua_setfield(L, -2, #x);
 
-    MCP_D(MCP_OK);
-    MCP_D(REQUEST_ANY);
-    MCP_D(REQUEST_GET);
-    MCP_D(REQUEST_SET);
-    MCP_D(REQUEST_DELETE);
-
-#undef MCP_D
+    X(P_OK);
+    X(CMD_ANY);
+    CMD_FIELDS
+#undef X
 }
+
+/*** REQUEST PARSER AND OBJECT ***/
+
+// FIXME: tokenize_command strlen's the command... why?
+// because multigets require it to parcel it up?
+// length == 0 but value != NULL means parse more from VALUE.
+// means there's no place to put the remaining length so etc.
+// TODO: re: multigets. think we need a special high level tokenizer, so by
+// this point command is always "get key", even when the client said
+// "get key key"
+// TODO: perhaps this could/should live in mcmc.
+static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
+    // we want to "parse in place" as much as possible, which allows us to
+    // forward an unmodified request without having to rebuild it.
+
+    // TODO: for the main parser we only need to find the cmd and key.
+    // NOTE: strcmp is a lot less complex than strncmp;
+    // temporarily swap the ' ' with a null byte and restore afterward?
+    // it's either that or copy it into local stack memory.
+    //
+    // the mcmc parser works by size and then switch and memcmp. lets try that
+    // and see how bad it is?
+    // maybe write some perl to auto-generate it from the command list? :)
+    char *cur = command;
+    int token = 0;
+    rq->tokens[token].value = cur;
+    // FIXME: cmdlen is too long. 'stats' won't work.
+    for (size_t i = cmdlen-2; i != 0; i--) {
+        if (*cur == ' ') {
+            rq->tokens[token].length = cur - rq->tokens[token].value;
+            if (++token == MAX_REQ_TOKENS) {
+                break;
+            }
+            rq->tokens[token].value = cur+1;
+        }
+        cur++;
+    }
+    // FIXME: if cur != value?
+    rq->tokens[token].length = cur - rq->tokens[token].value;
+    // FIXME: fails at exactly two tokens.
+
+    char *cm = rq->tokens[COMMAND_TOKEN].value;
+    size_t cl = rq->tokens[COMMAND_TOKEN].length;
+    int cmd = -1;
+
+    switch (cl) {
+        case 0:
+        case 1:
+            // FIXME: error/failure.
+            break;
+        case 2:
+            if (cm[0] == 'm') {
+                switch (cm[1]) {
+                    case 'g':
+                        cmd = CMD_MG;
+                        break;
+                    case 's':
+                        cmd = CMD_MS;
+                        // TODO: special mode to read data.
+                        //
+                        break;
+                    case 'd':
+                        cmd = CMD_MD;
+                        break;
+                    case 'n':
+                        cmd = CMD_MN;
+                        break;
+                    case 'a':
+                        cmd = CMD_MA;
+                        break;
+                    case 'e':
+                        cmd = CMD_ME;
+                        break;
+                }
+            }
+            break;
+        case 3:
+            if (cm[0] == 'g') {
+
+            }
+            break;
+    }
+
+    rq->command = cmd;
+}
+
+// steps for creating the request object:
+// - have lua allocate object (really?)
+//   - later pull from cache
+//   - might have mc_resp-like object and then wrap the lua obj with it
+// - call specialized process_command() code
+//   - mc_resp should already be on the connection. can write errors/etc
+//   - pass in c or resp?
+// - fill internal struct:
+//   - key/klen
+//   - what the cmd was
+//   - item data if it was an update/set req
+//   - allocate via item_alloc()
+// - put on lua stack
+// - return code for loading the item data if needed
+// - need to resume later... complete_nread_proxy/etc.
+static int mcp_new_request(lua_State *L, char *command, size_t cmdlen) {
+    // TODO: reserve userdata value for key/etc overrides?
+    mcp_request_t *rq = lua_newuserdatauv(L, sizeof(mcp_request_t), 1);
+    rq->request = command;
+    rq->reqlen = cmdlen;
+    rq->lua_key = false;
+
+    luaL_getmetatable(L, "mcp.request");
+    lua_setmetatable(L, -2);
+
+    // need to run request parser to get rq->command and other things.
+    // we can A: run tokenize on string, then "heal" it by writing ' ' back in
+    // place later, or try to parse out a const string.
+    // healing is probably faster for now since I can copypasta more code?
+    process_request(rq, command, cmdlen);
+
+    return 0;
+}
+
+// TODO: trace lua to confirm keeping the string in the uservalue ensures we
+// don't create it multiple times if lua asks for it in a loop.
+static int mcplib_request_key(lua_State *L) {
+    mcp_request_t *rq = luaL_checkudata(L, -1, "mcp.request");
+
+    if (!rq->lua_key) {
+        rq->lua_key = true;
+        lua_pushlstring(L, rq->tokens[KEY_TOKEN].value, rq->tokens[KEY_TOKEN].length);
+        lua_pushvalue(L, -1); // push an extra copy to gobble.
+        lua_setiuservalue(L, -3, 1);
+        // TODO: push nil if no key parsed.
+    } else{
+        // FIXME: ensure != LUA_TNONE?
+        lua_getiuservalue(L, -1, 1);
+    }
+    return 1;
+}
+
+static int mcplib_request_command(lua_State *L) {
+    mcp_request_t *rq = luaL_checkudata(L, -1, "mcp.request");
+    lua_pushinteger(L, rq->command);
+    return 1;
+}
+
+/*** END REQUET PARSER AND OBJECT ***/
 
 // Creates and returns the top level "mcp" module
 int proxy_register_libs(LIBEVENT_THREAD *t, void *ctx) {
@@ -1053,8 +1255,9 @@ int proxy_register_libs(LIBEVENT_THREAD *t, void *ctx) {
 
     // TODO: __gc
     const struct luaL_Reg mcplib_request_m[] = {
-        {"command", NULL},
-        {"key", NULL},
+        {"command", mcplib_request_command},
+        {"key", mcplib_request_key},
+        {"__tostring", NULL},
         {NULL, NULL}
     };
 
