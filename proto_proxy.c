@@ -718,10 +718,6 @@ static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
     // pull the lua hook function onto the stack.
     lua_rawgeti(Lc, LUA_REGISTRYINDEX, thr->proxy_attach_ref);
 
-    // TODO: we ship the raw request string to lua. Once the API is figured
-    // out this should be C bits instead so we can reuse memory.
-    // FIXME: do we have to push this before chopping the \r\n?
-    //lua_pushlstring(Lc, command, cmdlen);
     // FIXME: think we need to parse the request before looking at attach, so
     // we can attach to specific commands properly?
     mcp_new_request(Lc, command, cmdlen);
@@ -779,10 +775,8 @@ static void mcp_queue_io(conn *c, lua_State *L, lua_State *Lc) {
 
     // Then the request object.
     mcp_request_t *rq = luaL_checkudata(Lc, -2, "mcp.request");
-    //luaL_checktype(Lc, -2, LUA_TTABLE);
-    //size_t reqlen = 0;
-    //const char *req = luaL_tolstring(Lc, -2, &reqlen);
     // FIXME: need to check for "if request modified" and recreate it.
+    // Use a local function rather than calling __tostring through lua.
     size_t reqlen = rq->reqlen;
     const char *req = rq->request;
 
@@ -971,40 +965,24 @@ static int mcplib_hash_selector(lua_State *L) {
 
 // hashfunc(request) -> server(request)
 // needs key from request object.
-// TODO: fetching key from an array index via rawgeti is probably a lot faster
-// than the function call :/
+// TODO: if creating a custom request from lua this will need to change a bit.
 static int mcplib_hash_selector_call(lua_State *L) {
     // internal args are the hash selector (self)
     mcp_hash_selector_t *ss = luaL_checkudata(L, -2, "mcp.hash_selector");
-    /*
-    // then the request object (table)
-    luaL_checktype(L, -1, LUA_TTABLE);
-
-    lua_getfield(L, -1, "key"); // pull the key function onto the stack
-    if (!lua_isfunction(L, -1)) {
-        // FIXME: error
-    }
-    lua_pushvalue(L, -2); // copy the table for self arg
-
-    // call the function to retrieve the key
-    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
-        // FIXME: error
-    }
-
-    // top of stack should be the key now.
-    size_t len = 0;
-    const char *key = lua_tolstring(L, -1, &len);
-    */
+    // then request object.
     mcp_request_t *rq = luaL_checkudata(L, -1, "mcp.request");
 
     // we have a fast path to the key/length.
+    // FIXME: indicator for if request actually has a key token or not.
     char *key = rq->tokens[KEY_TOKEN].value;
     size_t len = rq->tokens[KEY_TOKEN].length;
     uint32_t hash = ss->func(key, len);
     int ref = ss->pool[hash % ss->pool_size].ref;
-    //lua_pop(L, 1); // pop the key. top should now be request again.
 
     // put the selected server onto the stack.
+    // TODO: watch if sticking the pointer reference on the request or
+    // response objects makes more sense, since it will be a bit faster.
+    // It should be since we immediately yield here.
     lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
 
     // now yield request, server up.
@@ -1110,12 +1088,9 @@ static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
     // we want to "parse in place" as much as possible, which allows us to
     // forward an unmodified request without having to rebuild it.
 
-    // TODO: for the main parser we only need to find the cmd and key.
-    // NOTE: strcmp is a lot less complex than strncmp;
-    // temporarily swap the ' ' with a null byte and restore afterward?
-    // it's either that or copy it into local stack memory.
+    // NOTE: for the main parser we only need to find the cmd and key.
     //
-    // the mcmc parser works by size and then switch and memcmp. lets try that
+    // the mcmc parser works by size and then switches and memcmp. lets try that
     // and see how bad it is?
     // maybe write some perl to auto-generate it from the command list? :)
     char *cur = command;
@@ -1181,21 +1156,6 @@ static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
     rq->command = cmd;
 }
 
-// steps for creating the request object:
-// - have lua allocate object (really?)
-//   - later pull from cache
-//   - might have mc_resp-like object and then wrap the lua obj with it
-// - call specialized process_command() code
-//   - mc_resp should already be on the connection. can write errors/etc
-//   - pass in c or resp?
-// - fill internal struct:
-//   - key/klen
-//   - what the cmd was
-//   - item data if it was an update/set req
-//   - allocate via item_alloc()
-// - put on lua stack
-// - return code for loading the item data if needed
-// - need to resume later... complete_nread_proxy/etc.
 static int mcp_new_request(lua_State *L, char *command, size_t cmdlen) {
     // TODO: reserve userdata value for key/etc overrides?
     mcp_request_t *rq = lua_newuserdatauv(L, sizeof(mcp_request_t), 1);
@@ -1207,11 +1167,12 @@ static int mcp_new_request(lua_State *L, char *command, size_t cmdlen) {
     lua_setmetatable(L, -2);
 
     // need to run request parser to get rq->command and other things.
-    // we can A: run tokenize on string, then "heal" it by writing ' ' back in
-    // place later, or try to parse out a const string.
-    // healing is probably faster for now since I can copypasta more code?
     process_request(rq, command, cmdlen);
 
+    // at this point we should know if we have to bounce through an nread to
+    // get item data or not.
+    // TODO: check flag or return code from process_request() and indicate to
+    // caller, or return rq to caller so it can check.
     return 0;
 }
 
@@ -1238,6 +1199,11 @@ static int mcplib_request_command(lua_State *L) {
     lua_pushinteger(L, rq->command);
     return 1;
 }
+
+// TODO: check what lua does when it calls a function with a string argument
+// stored from a table/similar (ie; the prefix check code).
+// If it's not copying anything, we can add request-side functions to do most
+// forms of matching and avoid copying the key to lua space.
 
 /*** END REQUET PARSER AND OBJECT ***/
 
