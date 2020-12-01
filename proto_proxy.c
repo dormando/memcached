@@ -54,6 +54,10 @@ typedef struct {
     size_t ntokens;
     int command; // numeric rep of the command from the request.
     bool lua_key; // if we've pushed the key to lua.
+    // placeholders for SET.
+    uint32_t flags;
+    int exptime;
+    int vlen;
 } mcp_request_t;
 
 // TODO: array of clients based on connection limit.
@@ -1084,6 +1088,7 @@ static void proxy_register_defines(lua_State *L) {
 // this point command is always "get key", even when the client said
 // "get key key"
 // TODO: perhaps this could/should live in mcmc.
+// TODO: return code ENUM with error types.
 static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
     // we want to "parse in place" as much as possible, which allows us to
     // forward an unmodified request without having to rebuild it.
@@ -1094,22 +1099,32 @@ static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
     // and see how bad it is?
     // maybe write some perl to auto-generate it from the command list? :)
     char *cur = command;
+    char *s = cur;
     int token = 0;
-    rq->tokens[token].value = cur;
+    // TODO: move this into a function that allows "parse_until" walks,
+    // returning where it stopped. Then next functions can parse as much as
+    // they need. This avoids meta commands creating dozens of tokens.
     // FIXME: cmdlen is too long. 'stats' won't work.
     for (size_t i = cmdlen-2; i != 0; i--) {
         if (*cur == ' ') {
-            rq->tokens[token].length = cur - rq->tokens[token].value;
-            if (++token == MAX_REQ_TOKENS) {
+            rq->tokens[token].value = s;
+            rq->tokens[token].length = cur - s;
+            token++;
+            if (token == MAX_REQ_TOKENS) {
+                cur++;
+                s = cur;
                 break;
             }
-            rq->tokens[token].value = cur+1;
+            s = cur + 1;
         }
         cur++;
     }
-    // FIXME: if cur != value?
-    rq->tokens[token].length = cur - rq->tokens[token].value;
-    // FIXME: fails at exactly two tokens.
+
+    if (s != cur) {
+        rq->tokens[token].value = s;
+        rq->tokens[token].length = cur - s;
+        token++;
+    }
 
     char *cm = rq->tokens[COMMAND_TOKEN].value;
     size_t cl = rq->tokens[COMMAND_TOKEN].length;
@@ -1129,7 +1144,8 @@ static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
                     case 's':
                         cmd = CMD_MS;
                         // TODO: special mode to read data.
-                        //
+                        // need to parse enough to know how to read.
+                        // ms <key> <flags>*\r\n
                         break;
                     case 'd':
                         cmd = CMD_MD;
@@ -1149,6 +1165,44 @@ static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
         case 3:
             if (cm[0] == 'g') {
 
+            } else if (cm[0] == 's' && cm[1] == 'e' && cm[2] == 't') {
+                // see mcmc.c's _mcmc_parse_value_line() for the trick
+                // set <key> <flags> <exptime> <bytes> [noreply]\r\n
+                cmd = CMD_SET;
+                if (token != 2) {
+                    fprintf(stderr, "ERROR\n");
+                    return;
+                }
+                errno = 0;
+                char *n = NULL;
+                uint32_t flags = strtoul(cur, &n, 10);
+                if ((errno == ERANGE) || (cur == n) || (*n != ' ')) {
+                    fprintf(stderr, "ERROR PARSING REQUEST\n");
+                    return;
+                }
+                cur = n;
+
+                errno = 0;
+                int exptime = strtol(cur, &n, 10);
+                if ((errno == ERANGE) || (cur == n) || (*n != ' ')) {
+                    fprintf(stderr, "ERROR PARSING REQUEST\n");
+                    return;
+                }
+                cur = n;
+
+                errno = 0;
+                int vlen = strtol(cur, &n, 10);
+                if ((errno == ERANGE) || (cur == n)) {
+                    fprintf(stderr, "ERROR PARSING REQUEST\n");
+                    return;
+                }
+                cur = n;
+
+                rq->flags = flags;
+                rq->exptime = exptime;
+                rq->vlen = vlen; // TODO: validate vlen here?
+                // TODO: if next byte has a space, we check for noreply.
+                // TODO: ensure last character is \r
             }
             break;
     }
