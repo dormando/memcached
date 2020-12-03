@@ -24,12 +24,6 @@
 #define MCP_THREAD_UPVALUE 1
 #define MCP_ATTACH_UPVALUE 2
 
-static void process_proxy_command(conn *c, char *command, size_t cmdlen);
-static void dump_stack(lua_State *L);
-static void mcp_queue_io(conn *c, lua_State *l, lua_State *Lc);
-static int mcp_new_request(lua_State *L, char *command, size_t cmdlen);
-static void proxy_server_handler(const int fd, const short which, void *arg);
-
 typedef uint32_t (*hash_selector_func)(const void *key, size_t len);
 typedef struct {
     hash_selector_func func;
@@ -103,6 +97,13 @@ struct _io_pending_proxy_t {
     mcp_resp_t *client_resp; // reference (currently pointing to a lua object)
     bool flushed; // whether we've fully written this request to a backend.
 };
+
+static void process_proxy_command(conn *c, char *command, size_t cmdlen);
+static void dump_stack(lua_State *L);
+static void mcp_queue_io(conn *c, lua_State *l, lua_State *Lc);
+static mcp_request_t *mcp_new_request(lua_State *L, char *command, size_t cmdlen);
+static void proxy_server_handler(const int fd, const short which, void *arg);
+
 
 // -------------- EXTERNAL FUNCTIONS
 
@@ -690,11 +691,100 @@ int try_read_command_proxy(conn *c) {
 
 }
 
-static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
+// we buffered a SET of some kind.
+void complete_nread_proxy(conn *c) {
+    assert(c != NULL);
+
+    item *it = c->item;
+    bool is_valid = false;
+
+    // TODO: move section to function call
+    if ((it->it_flags & ITEM_CHUNKED) == 0) {
+        if (strncmp(ITEM_data(it) + it->nbytes - 2, "\r\n", 2) == 0) {
+            is_valid = true;
+        }
+    } else {
+        char buf[2];
+        /* should point to the final item chunk */
+        item_chunk *ch = (item_chunk *) c->ritem;
+        assert(ch->used != 0);
+        /* :( We need to look at the last two bytes. This could span two
+         * chunks.
+         */
+        if (ch->used > 1) {
+            buf[0] = ch->data[ch->used - 2];
+            buf[1] = ch->data[ch->used - 1];
+        } else {
+            assert(ch->prev);
+            assert(ch->used == 1);
+            buf[0] = ch->prev->data[ch->prev->used - 1];
+            buf[1] = ch->data[ch->used - 1];
+        }
+        if (strncmp(buf, "\r\n", 2) == 0) {
+            is_valid = true;
+        }
+    }
+
+    if (!is_valid) {
+        // TODO: error handling.
+        return;
+    }
+
+    // TODO: need to move this reference to the request object.
+    // we've not set it anywhere, but are using the data for the request
+    // later.
+    //item_remove(c->item);
+    conn_set_state(c, conn_new_cmd);
+
+    // TODO: function!
     LIBEVENT_THREAD *thr = c->thread;
     lua_State *L = thr->L;
+    lua_State *Lc= lua_tothread(L, -1);
+    int nresults = 0;
 
+    // call the function via coroutine.
+    int cores = lua_resume(Lc, NULL, 1, &nresults);
+    mc_resp *resp = c->resp;
+    size_t rlen = 0;
+
+    if (cores == LUA_OK) {
+        // figure out if we have a response object, raw string, or what.
+        int type = lua_type(Lc, -1);
+
+        if ((type == LUA_TUSERDATA && lua_getiuservalue(Lc, -1, 1) != LUA_TNONE) || type == LUA_TSTRING) {
+            // FIXME: checkudata, testudata? anything to directly check this?
+            const char *s = lua_tolstring(Lc, -1, &rlen);
+            size_t l = rlen > WRITE_BUFFER_SIZE ? WRITE_BUFFER_SIZE : rlen;
+            memcpy(resp->wbuf, s, l);
+            resp_add_iov(resp, resp->wbuf, l);
+            lua_pop(Lc, 1);
+        } else {
+            memcpy(resp->wbuf, "ERROR\r\n", 7);
+            resp_add_iov(resp, resp->wbuf, 7);
+        }
+    } else if (cores == LUA_YIELD) {
+        // NOTE: this is returning "self" somehow. not sure if it matters.
+        dump_stack(Lc);
+        // This holds a reference to Lc so it can be resumed on this thread
+        // later. Lc itself holds references to server/request data.
+        mcp_queue_io(c, L, Lc);
+    } else {
+        // error?
+        fprintf(stderr, "Failed to run coroutine: %s\n", lua_tostring(Lc, -1));
+        // TODO: send generic ERROR and stop here.
+        memcpy(resp->wbuf, "SERVER_ERROR lua failure\r\n", 15);
+        resp_add_iov(resp, resp->wbuf, 15);
+    }
+
+    return;
+}
+
+/******** END PUBLIC COMMANDS ******/
+
+static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
     assert(c != NULL);
+    LIBEVENT_THREAD *thr = c->thread;
+    lua_State *L = thr->L;
 
     MEMCACHED_PROCESS_COMMAND_START(c->sfd, c->rcurr, c->rbytes);
 
@@ -724,7 +814,43 @@ static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
 
     // FIXME: think we need to parse the request before looking at attach, so
     // we can attach to specific commands properly?
-    mcp_new_request(Lc, command, cmdlen);
+    mcp_request_t *rq = mcp_new_request(Lc, command, cmdlen);
+    // TODO: a better indicator of needing nread.
+    // TODO: lift this to a post-processor?
+    if (rq->vlen != 0) {
+        // here we do a bottom half of a SET routine.
+        item *it = item_alloc(rq->tokens[KEY_TOKEN].value,
+                rq->tokens[KEY_TOKEN].length,
+                rq->flags,
+                realtime(EXPTIME_TO_POSITIVE_TIME(rq->exptime)),
+                rq->vlen);
+
+        if (it == NULL) {
+            // TODO: extra failure from proecess_update_command()
+            // lua_pop, settop, etc?
+            return;
+        }
+
+        // TODO: CAS stuff as well.
+        c->item = it;
+#ifdef NEED_ALIGN
+        if (it->it_flags & ITEM_CHUNKED) {
+            c->ritem = ITEM_schunk(it);
+        } else {
+            c->ritem = ITEM_data(it);
+        }
+#else
+        c->ritem = ITEM_data(it);
+#endif
+        c->rlbytes = it->nbytes;
+        // used eventually for store_item, and also the dtrace bits.
+        //c->cmd = comm;
+        conn_set_state(c, conn_nread);
+
+        // FIXME: need to stash the coroutine ptr?
+        // should still be on (thr->L, -1)
+        return;
+    }
 
     // call the function via coroutine.
     int cores = lua_resume(Lc, NULL, 1, &nresults);
@@ -1126,6 +1252,7 @@ static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
         token++;
     }
 
+    rq->vlen = 0; // TODO: remove this once set indicator is decided
     char *cm = rq->tokens[COMMAND_TOKEN].value;
     size_t cl = rq->tokens[COMMAND_TOKEN].length;
     int cmd = -1;
@@ -1198,9 +1325,15 @@ static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
                 }
                 cur = n;
 
+                if (vlen < 0 || vlen > (INT_MAX - 2)) {
+                   fprintf(stderr, "ERROR\n");
+                   return;
+                }
+                vlen += 2;
+
                 rq->flags = flags;
                 rq->exptime = exptime;
-                rq->vlen = vlen; // TODO: validate vlen here?
+                rq->vlen = vlen;
                 // TODO: if next byte has a space, we check for noreply.
                 // TODO: ensure last character is \r
             }
@@ -1210,7 +1343,7 @@ static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
     rq->command = cmd;
 }
 
-static int mcp_new_request(lua_State *L, char *command, size_t cmdlen) {
+static mcp_request_t *mcp_new_request(lua_State *L, char *command, size_t cmdlen) {
     // TODO: reserve userdata value for key/etc overrides?
     mcp_request_t *rq = lua_newuserdatauv(L, sizeof(mcp_request_t), 1);
     rq->request = command;
@@ -1220,14 +1353,18 @@ static int mcp_new_request(lua_State *L, char *command, size_t cmdlen) {
     luaL_getmetatable(L, "mcp.request");
     lua_setmetatable(L, -2);
 
-    // need to run request parser to get rq->command and other things.
+    // need to run request parser to get rq->command, know when to drop to
+    // nread, handle errors, etc.
+    // TODO: actually boost errors from request parser :P
+    // need to keep in mind that parsing should be optionally strict, so we
+    // can handle arbitrary text commands for proxy code.
     process_request(rq, command, cmdlen);
 
     // at this point we should know if we have to bounce through an nread to
     // get item data or not.
     // TODO: check flag or return code from process_request() and indicate to
     // caller, or return rq to caller so it can check.
-    return 0;
+    return rq;
 }
 
 // TODO: trace lua to confirm keeping the string in the uservalue ensures we

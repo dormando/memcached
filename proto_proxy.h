@@ -3,6 +3,7 @@
 
 /* proxy mode handlers */
 int try_read_command_proxy(conn *c);
+void complete_nread_proxy(conn *c);
 void proxy_thread_init(LIBEVENT_THREAD *thr);
 
 void proxy_submit_cb(void *ctx, void *ctx_stack);
