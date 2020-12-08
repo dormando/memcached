@@ -40,6 +40,14 @@ enum mcp_server_states {
     mcp_server_next, // advance to the next IO
 };
 
+// TODO: tokens, request/etc, aren't safe when used by lua. we need to copy
+// the string in after an allocation and __gc it later (or remove it early?)
+// for the C API these could just point into c->rbuf and be a fast path.
+// for lua it could work if we enforce request objects to be destroyed when
+// their original coroutine is killed.
+// the request object could be "marked" as invalid at the same time as
+// resetthread is called.
+// need to confirm that c->rbuf is safe to use the whole time as well.
 #define MAX_REQ_TOKENS 2
 typedef struct {
     char *request; // original whole string command.
@@ -52,6 +60,7 @@ typedef struct {
     uint32_t flags;
     int exptime;
     int vlen;
+    item *item; // slabbed item for SET buffering.
 } mcp_request_t;
 
 // TODO: array of clients based on connection limit.
@@ -362,38 +371,30 @@ static int proxy_server_drive_machine(mcp_server_t *s) {
 }
 
 // TODO: this function is incomplete:
-// - doesn't set ->flushed
 // - error propagation
-static int _flush_pending_writes(mcp_server_t *s) {
-    io_pending_proxy_t *p = s->req_stack_head;
+static int _flush_pending_write(mcp_server_t *s, io_pending_proxy_t *p) {
     int flags = 0;
 
-    // Told to check queue with nothing in it; connect-ahead?
-    if (p == NULL) {
+    if (p->flushed) {
         return 0;
     }
 
-    while (p) {
-        io_pending_proxy_t *next_p = p->server_next;
-        if (!p->flushed) {
-            int status = mcmc_send_request(s->client, p->req, p->reqlen, 1);
+    int status = mcmc_send_request(s->client, p->req, p->reqlen, 1);
 
-            if (status == MCMC_WANT_WRITE) {
-                s->can_write = false; // not necessary but for consistency.
-                flags |= EV_WRITE;
-                break; // can't continue for now.
-            } else if (status != MCMC_OK) {
-                // TODO: error propagation.
-                return 0;
-            } else {
-                p->flushed = true;
-            }
-
-            flags |= EV_READ;
-        }
-
-        p = next_p;
+    if (status == MCMC_WANT_WRITE) {
+        // avoid syscalls for any other queued requests.
+        s->can_write = false;
+        flags |= EV_WRITE;
+        return flags; // can't continue for now.
+    } else if (status != MCMC_OK) {
+        // TODO: error propagation.
+        // s->error = code?
+        return 0;
+    } else {
+        p->flushed = true;
     }
+
+    flags |= EV_READ;
 
     return flags;
 }
@@ -431,9 +432,12 @@ static void proxy_server_handler(const int fd, const short which, void *arg) {
             }
 
         }
-        // TODO: walk stack until we've flushed everything.
-        // need indicators on written amounts.
-        flags |= _flush_pending_writes(s);
+        io_pending_proxy_t *p = s->req_stack_head;
+        while (p) {
+            io_pending_proxy_t *next_p = p->server_next;
+            flags |= _flush_pending_write(s, p);
+            p = next_p;
+        }
     }
 
     // Still pending requests to read or write.
@@ -476,23 +480,8 @@ void proxy_submit_cb(void *ctx, void *ctx_stack) {
         // the request.
         if (s->can_write) {
             // TODO: check for connected, reconnect if necessary.
-            int status = mcmc_send_request(s->client, p->req, p->reqlen, 1);
-
-            if (status == MCMC_WANT_WRITE) {
-                // avoid syscalls for any other queued requests.
-                s->can_write = false;
-                // s->client is tracking the amount of data already sent on
-                // this request. we need to call it again with the same
-                // arguments later.
-            } else if (status != MCMC_OK) {
-                // TODO: real error propagation.
-                // should just need to mark the request as done, io_pending--, etc.
-                fprintf(stderr, "Failed to send request to memcached: %s:%s\n", s->ip, s->port);
-                // FIXME: p = p->next; continue; ?
-                return;
-            } else {
-                p->flushed = true;
-            }
+            // s->can_write should deal with this?
+            _flush_pending_write(s, p);
         }
 
         // FIXME: chicken and egg.
