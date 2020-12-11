@@ -25,6 +25,13 @@ my $sock = $srv->sock;
 my $p_srv = new_memcached('-o proxy_config=./t/startfile.lua');
 my $p_sock = $p_srv->sock;
 
+# set through proxy.
+# works when the route isn't set to "walkall". can't currently reschedule.
+{
+    #print $p_sock "set /foo/z 0 0 5\r\nhello\r\n";
+    #is(scalar <$sock>, "STORED\r\n", "stored test value through proxy");
+}
+
 # Load some keys to backend server.
 my $bdata = 'x' x 256000;
 {

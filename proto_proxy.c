@@ -48,6 +48,7 @@ enum mcp_server_states {
 // the request object could be "marked" as invalid at the same time as
 // resetthread is called.
 // need to confirm that c->rbuf is safe to use the whole time as well.
+// FIXME: until __gc is added rq->buf will leak.
 #define MAX_REQ_TOKENS 2
 typedef struct {
     char *request; // original whole string command.
@@ -60,7 +61,7 @@ typedef struct {
     uint32_t flags;
     int exptime;
     int vlen;
-    item *item; // slabbed item for SET buffering.
+    void *buf; // temporary buffer for SET/payload requests.
 } mcp_request_t;
 
 // TODO: array of clients based on connection limit.
@@ -101,8 +102,8 @@ struct _io_pending_proxy_t {
     int coro_ref; // lua registry reference to the coroutine
     lua_State *coro; // pointer directly to the coroutine
     mcp_server_t *server; // backend server to request from
-    const char *req; // request string
-    size_t reqlen; // real length of the request
+    struct iovec iov[2]; // request string + tail buffer
+    int iovcnt; // 1 or 2...
     mcp_resp_t *client_resp; // reference (currently pointing to a lua object)
     bool flushed; // whether we've fully written this request to a backend.
 };
@@ -212,6 +213,8 @@ static int proxy_server_drive_machine(mcp_server_t *s) {
                 case MCMC_RESP_META:
                     // we can handle meta responses easily since they're self
                     // contained.
+                    break;
+                case MCMC_RESP_GENERIC:
                     break;
                 // TODO: No-op response?
                 default:
@@ -363,6 +366,7 @@ static int proxy_server_drive_machine(mcp_server_t *s) {
 
             break;
         default:
+            fprintf(stderr, "invalid state: %d\n", s->state);
             assert(false);
     } // switch
     } // while
@@ -379,8 +383,29 @@ static int _flush_pending_write(mcp_server_t *s, io_pending_proxy_t *p) {
         return 0;
     }
 
-    int status = mcmc_send_request(s->client, p->req, p->reqlen, 1);
+    ssize_t sent = 0;
+    // FIXME: original send function internally tracked how much was sent, but
+    // doing this here would require copying all of the iovecs or modify what
+    // we supply.
+    // this is probably okay but I want to leave a note here in case I get a
+    // better idea.
+    int status = mcmc_request_writev(s->client, p->iov, p->iovcnt, &sent, 1);
+    if (sent > 0) {
+        // we need to save progress in case of WANT_WRITE.
+        for (int x = 0; x < p->iovcnt; x++) {
+            struct iovec *iov = &p->iov[x];
+            if (sent >= iov->iov_len) {
+                sent -= iov->iov_len;
+                iov->iov_len = 0;
+            } else {
+                iov->iov_len -= sent;
+                sent = 0;
+                break;
+            }
+        }
+    }
 
+    // request_writev() returns WANT_WRITE if we haven't fully flushed.
     if (status == MCMC_WANT_WRITE) {
         // avoid syscalls for any other queued requests.
         s->can_write = false;
@@ -684,51 +709,22 @@ int try_read_command_proxy(conn *c) {
 void complete_nread_proxy(conn *c) {
     assert(c != NULL);
 
-    item *it = c->item;
-    bool is_valid = false;
-
-    // TODO: move section to function call
-    if ((it->it_flags & ITEM_CHUNKED) == 0) {
-        if (strncmp(ITEM_data(it) + it->nbytes - 2, "\r\n", 2) == 0) {
-            is_valid = true;
-        }
-    } else {
-        char buf[2];
-        /* should point to the final item chunk */
-        item_chunk *ch = (item_chunk *) c->ritem;
-        assert(ch->used != 0);
-        /* :( We need to look at the last two bytes. This could span two
-         * chunks.
-         */
-        if (ch->used > 1) {
-            buf[0] = ch->data[ch->used - 2];
-            buf[1] = ch->data[ch->used - 1];
-        } else {
-            assert(ch->prev);
-            assert(ch->used == 1);
-            buf[0] = ch->prev->data[ch->prev->used - 1];
-            buf[1] = ch->data[ch->used - 1];
-        }
-        if (strncmp(buf, "\r\n", 2) == 0) {
-            is_valid = true;
-        }
-    }
-
-    if (!is_valid) {
-        // TODO: error handling.
-        return;
-    }
-
-    // TODO: need to move this reference to the request object.
-    // we've not set it anywhere, but are using the data for the request
-    // later.
-    //item_remove(c->item);
     conn_set_state(c, conn_new_cmd);
 
     // TODO: function!
     LIBEVENT_THREAD *thr = c->thread;
     lua_State *L = thr->L;
-    lua_State *Lc= lua_tothread(L, -1);
+    lua_State *Lc = lua_tothread(L, -1);
+    // FIXME: could use a quicker method to retrieve the request.
+    mcp_request_t *rq = luaL_checkudata(Lc, -1, "mcp.request");
+
+    // validate the data chunk.
+    if (strncmp((char *)c->item + rq->vlen - 2, "\r\n", 2) != 0) {
+        // TODO: error handling.
+        return;
+    }
+    rq->buf = c->item;
+    c->item = NULL;
     int nresults = 0;
 
     // call the function via coroutine.
@@ -807,33 +803,15 @@ static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
     // TODO: a better indicator of needing nread.
     // TODO: lift this to a post-processor?
     if (rq->vlen != 0) {
-        // here we do a bottom half of a SET routine.
-        item *it = item_alloc(rq->tokens[KEY_TOKEN].value,
-                rq->tokens[KEY_TOKEN].length,
-                rq->flags,
-                realtime(EXPTIME_TO_POSITIVE_TIME(rq->exptime)),
-                rq->vlen);
-
-        if (it == NULL) {
-            // TODO: extra failure from proecess_update_command()
-            // lua_pop, settop, etc?
-            return;
+        // relying on temporary malloc's not succumbing as poorly to
+        // fragmentation.
+        c->item = malloc(rq->vlen);
+        if (c->item == NULL) {
+            // TODO: error handling.
         }
+        c->ritem = c->item;
+        c->rlbytes = rq->vlen;
 
-        // TODO: CAS stuff as well.
-        c->item = it;
-#ifdef NEED_ALIGN
-        if (it->it_flags & ITEM_CHUNKED) {
-            c->ritem = ITEM_schunk(it);
-        } else {
-            c->ritem = ITEM_data(it);
-        }
-#else
-        c->ritem = ITEM_data(it);
-#endif
-        c->rlbytes = it->nbytes;
-        // used eventually for store_item, and also the dtrace bits.
-        //c->cmd = comm;
         conn_set_state(c, conn_nread);
 
         // FIXME: need to stash the coroutine ptr?
@@ -896,8 +874,6 @@ static void mcp_queue_io(conn *c, lua_State *L, lua_State *Lc) {
     mcp_request_t *rq = luaL_checkudata(Lc, -2, "mcp.request");
     // FIXME: need to check for "if request modified" and recreate it.
     // Use a local function rather than calling __tostring through lua.
-    size_t reqlen = rq->reqlen;
-    const char *req = rq->request;
 
     // Then we push a response object, which we'll re-use later.
     // reserve one uservalue for a lua-supplied response.
@@ -936,8 +912,14 @@ static void mcp_queue_io(conn *c, lua_State *L, lua_State *Lc) {
 
     // The stringified request. This is also referencing into the coroutine
     // stack, which should be safe from gc.
-    p->req = req;
-    p->reqlen = reqlen;
+    p->iov[0].iov_base = rq->request;
+    p->iov[0].iov_len = rq->reqlen;
+    p->iovcnt = 1;
+    if (rq->vlen != 0) {
+        p->iov[1].iov_base = rq->buf;
+        p->iov[1].iov_len = rq->vlen;
+        p->iovcnt = 2;
+    }
 
     // link into the batch chain.
     p->next = q->stack_ctx;
