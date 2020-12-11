@@ -563,6 +563,7 @@ void proxy_complete_cb(void *ctx, void *ctx_stack) {
     io_pending_proxy_t *p = ctx_stack;
 
     while (p) {
+        io_pending_proxy_t *next = p->next;
         int nresults = 0;
         mc_resp *resp = p->resp;
         lua_State *Lc = p->coro;
@@ -610,10 +611,22 @@ void proxy_complete_cb(void *ctx, void *ctx_stack) {
             }
 
         } else if (cores == LUA_YIELD) {
-            // TODO: need to remove/free and re-create io-pending, or extend
-            // mcp_queue_io() to overwrite an existing IO.
-            // if we're freeing/etc then we need to cuddle p->next in the
-            // while loop.
+            // need to remove and free the io_pending, since c->resp owns it.
+            // so we call mcp_queue_io() again and let it override the
+            // mc_resp's io_pending object.
+            // FIXME: experimental inline free/reuse of resp here! an
+            // alternative could be to just create mc_resp's with io_pendings
+            // and stack them (but leave resp->skip = true by default).
+            // swapping the pendings here should be a little faster overall
+            // though.
+            //
+            // FIXME: coroutine's LUA_REGISTRYINDEX is the same as L?
+            // should be obvious if memory leaks I guess.
+            luaL_unref(p->coro, LUA_REGISTRYINDEX, p->coro_ref);
+            conn *c = p->c;
+            do_cache_free(p->c->thread->io_cache, p);
+            // *p is now dead.
+            mcp_queue_io(c, c->thread->L, Lc);
             printf("C: yield from completed: %d\n", nresults);
             dump_stack(Lc);
         } else {
@@ -625,7 +638,7 @@ void proxy_complete_cb(void *ctx, void *ctx_stack) {
             resp_add_iov(resp, resp->wbuf, 15);
         }
 
-        p = p->next;
+        p = next;
     }
     return;
 }
@@ -983,6 +996,7 @@ static int mcplib_server(lua_State *L) {
     s->rbuf = NULL;
     s->req_stack_head = NULL;
     s->req_stack_tail = NULL;
+    s->state = mcp_server_read;
     s->connecting = false;
     s->can_write = false;
 
