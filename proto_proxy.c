@@ -822,6 +822,7 @@ static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
         if (c->item == NULL) {
             // TODO: error handling.
         }
+        c->item_malloced = true;
         c->ritem = c->item;
         c->rlbytes = rq->vlen;
 

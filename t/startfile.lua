@@ -138,10 +138,10 @@ function command_factory(map, default)
     return function(r)
         local f = map[r:command()]
         if f == nil then
-            print("default command")
+            -- print("default command")
             return d(r)
         end
-        print("override command")
+        -- print("override command")
         return f(r)
     end
 end
