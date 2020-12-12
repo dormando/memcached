@@ -110,7 +110,7 @@ struct _io_pending_proxy_t {
 
 static void process_proxy_command(conn *c, char *command, size_t cmdlen);
 static void dump_stack(lua_State *L);
-static void mcp_queue_io(conn *c, lua_State *l, lua_State *Lc);
+static void mcp_queue_io(conn *c, int coro_ref, lua_State *Lc);
 static mcp_request_t *mcp_new_request(lua_State *L, char *command, size_t cmdlen);
 static void proxy_server_handler(const int fd, const short which, void *arg);
 
@@ -620,13 +620,11 @@ void proxy_complete_cb(void *ctx, void *ctx_stack) {
             // swapping the pendings here should be a little faster overall
             // though.
             //
-            // FIXME: coroutine's LUA_REGISTRYINDEX is the same as L?
-            // should be obvious if memory leaks I guess.
-            luaL_unref(p->coro, LUA_REGISTRYINDEX, p->coro_ref);
+            int coro_ref = p->coro_ref;
             conn *c = p->c;
             do_cache_free(p->c->thread->io_cache, p);
             // *p is now dead.
-            mcp_queue_io(c, c->thread->L, Lc);
+            mcp_queue_io(c, coro_ref, Lc);
             //printf("C: yield from completed: %d\n", nresults);
             //dump_stack(Lc);
         } else {
@@ -765,7 +763,8 @@ void complete_nread_proxy(conn *c) {
         //dump_stack(Lc);
         // This holds a reference to Lc so it can be resumed on this thread
         // later. Lc itself holds references to server/request data.
-        mcp_queue_io(c, L, Lc);
+        int coro_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        mcp_queue_io(c, coro_ref, Lc);
     } else {
         // error?
         fprintf(stderr, "Failed to run coroutine: %s\n", lua_tostring(Lc, -1));
@@ -858,7 +857,8 @@ static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
         //dump_stack(Lc);
         // This holds a reference to Lc so it can be resumed on this thread
         // later. Lc itself holds references to server/request data.
-        mcp_queue_io(c, L, Lc);
+        int coro_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        mcp_queue_io(c, coro_ref, Lc);
     } else {
         // error?
         fprintf(stderr, "Failed to run coroutine: %s\n", lua_tostring(Lc, -1));
@@ -877,7 +877,7 @@ static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
 // connection's response object. stack enough information to write to the
 // server on the submit callback, and enough to resume the lua state on the
 // completion callback.
-static void mcp_queue_io(conn *c, lua_State *L, lua_State *Lc) {
+static void mcp_queue_io(conn *c, int coro_ref, lua_State *Lc) {
     io_queue_t *q = conn_io_queue_get(c, IO_QUEUE_PROXY);
     mc_resp *resp = c->resp;
 
@@ -915,7 +915,7 @@ static void mcp_queue_io(conn *c, lua_State *L, lua_State *Lc) {
 
     // top of the main thread should be our coroutine.
     // lets grab a reference to it and pop so it doesn't get gc'ed.
-    p->coro_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    p->coro_ref = coro_ref;
 
     // we'll drop the pointer to the coro on here to save some CPU
     // on re-fetching it later. The pointer shouldn't change.
