@@ -628,12 +628,14 @@ void proxy_complete_cb(void *ctx, void *ctx_stack) {
             //dump_stack(Lc);
         } else {
             // error?
-            fprintf(stderr, "Failed to run coroutine: %s\n", lua_tostring(Lc, -1));
+            fprintf(stderr, "CFailed to run coroutine: %s\n", lua_tostring(Lc, -1));
             // TODO: send generic ERROR and stop here. Also I know the length
             // is wrong :)
             memcpy(resp->wbuf, "SERVER_ERROR lua failure\r\n", 27);
             resp_add_iov(resp, resp->wbuf, 27);
         }
+
+        // don't need to flatten main thread here, since the coro is gone.
 
         p = next;
     }
@@ -731,6 +733,7 @@ void complete_nread_proxy(conn *c) {
     // validate the data chunk.
     if (strncmp((char *)c->item + rq->vlen - 2, "\r\n", 2) != 0) {
         // TODO: error handling.
+        lua_settop(L, 0); // clear anything remaining on the main thread.
         return;
     }
     rq->buf = c->item;
@@ -766,11 +769,13 @@ void complete_nread_proxy(conn *c) {
         mcp_queue_io(c, coro_ref, Lc);
     } else {
         // error?
-        fprintf(stderr, "Failed to run coroutine: %s\n", lua_tostring(Lc, -1));
+        fprintf(stderr, "NFailed to run coroutine: %s\n", lua_tostring(Lc, -1));
         // TODO: send generic ERROR and stop here.
         memcpy(resp->wbuf, "SERVER_ERROR lua failure\r\n", 27);
         resp_add_iov(resp, resp->wbuf, 27);
     }
+
+    lua_settop(L, 0); // clear anything remaining on the main thread.
 
     return;
 }
@@ -860,11 +865,13 @@ static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
         mcp_queue_io(c, coro_ref, Lc);
     } else {
         // error?
-        fprintf(stderr, "Failed to run coroutine: %s\n", lua_tostring(Lc, -1));
+        fprintf(stderr, "PFailed to run coroutine: %s\n", lua_tostring(Lc, -1));
         // TODO: send generic ERROR and stop here.
         memcpy(resp->wbuf, "SERVER_ERROR lua failure\r\n", 27);
         resp_add_iov(resp, resp->wbuf, 27);
     }
+
+    lua_settop(L, 0); // clear anything remaining on the main thread.
 
     /*printf("main thread stack:\n");
     dump_stack(L);
