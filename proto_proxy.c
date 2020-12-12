@@ -474,7 +474,14 @@ static void proxy_server_handler(const int fd, const short which, void *arg) {
     // TODO: need to handle errors from above so we don't go to sleep here.
     if (s->req_stack_head != NULL) {
         // set the event.
-        if (event_initialized(&s->event) == 0 || event_pending(&s->event, EV_READ|EV_WRITE, NULL) == 0) {
+        int pending = 0;
+        if (event_initialized(&s->event)) {
+            pending = event_pending(&s->event, EV_READ|EV_WRITE|EV_TIMEOUT, NULL);
+        }
+        if ((pending & (EV_READ|EV_WRITE)) == 0) {
+            if (pending & EV_TIMEOUT) {
+                event_del(&s->event); // in case there's an EV_TIMEOUT already.
+            }
             event_assign(&s->event, s->req_stack_head->c->thread->base, mcmc_fd(s->client),
                     flags, proxy_server_handler, s);
             event_add(&s->event, &tmp_time);
@@ -514,7 +521,15 @@ void proxy_submit_cb(void *ctx, void *ctx_stack) {
         // don't want to double test here. should be able to event_assign but
         // not add anything during initialization, but need the owner thread's
         // event base.
-        if (event_initialized(&s->event) == 0 || event_pending(&s->event, EV_READ|EV_WRITE, NULL) == 0) {
+        int pending = 0;
+        if (event_initialized(&s->event)) {
+            pending = event_pending(&s->event, EV_READ|EV_WRITE|EV_TIMEOUT, NULL);
+        }
+        if ((pending & (EV_READ|EV_WRITE)) == 0) {
+            if (pending & EV_TIMEOUT) {
+                event_del(&s->event); // in case there's an EV_TIMEOUT already.
+            }
+
             // if we can't write, we could be connecting.
             // TODO: always checking for READ in case some commands were sent
             // successfully. The flags could be tracked on *s and reset in the
