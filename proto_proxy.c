@@ -583,7 +583,6 @@ void proxy_complete_cb(void *ctx, void *ctx_stack) {
             int type = lua_type(Lc, -1);
             if (type == LUA_TUSERDATA) {
                 mcp_resp_t *r = luaL_checkudata(Lc, -1, "mcp.response");
-                // TODO: utilize r->it.
                 if (r->buf) {
                     // response set from C.
                     // FIXME: write_and_free() ? it's a bit wrong for here.
@@ -982,6 +981,18 @@ static int mcplib_response_ok(lua_State *L) {
     return 1;
 }
 
+static int mcplib_response_gc(lua_State *L) {
+    mcp_resp_t *r = luaL_checkudata(L, -1, "mcp.response");
+
+    // On error/similar we might be holding the read buffer.
+    // If the buf is handed off to mc_resp for return, this pointer is NULL
+    if (r->buf != NULL) {
+        free(r->buf);
+    }
+
+    return 0;
+}
+
 static int mcplib_server(lua_State *L) {
     const char *ip = luaL_checkstring(L, -3); // FIXME: checklstring?
     const char *port = luaL_checkstring(L, -2);
@@ -1337,9 +1348,9 @@ static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
 static mcp_request_t *mcp_new_request(lua_State *L, char *command, size_t cmdlen) {
     // TODO: reserve userdata value for key/etc overrides?
     mcp_request_t *rq = lua_newuserdatauv(L, sizeof(mcp_request_t), 1);
+    memset(rq, 0, sizeof(mcp_request_t));
     rq->request = command;
     rq->reqlen = cmdlen;
-    rq->lua_key = false;
 
     luaL_getmetatable(L, "mcp.request");
     lua_setmetatable(L, -2);
@@ -1382,6 +1393,14 @@ static int mcplib_request_command(lua_State *L) {
     return 1;
 }
 
+static int mcplib_request_gc(lua_State *L) {
+    mcp_request_t *rq = luaL_checkudata(L, -1, "mcp.request");
+    if (rq->buf != NULL) {
+        free(rq->buf);
+    }
+    return 0;
+}
+
 // TODO: check what lua does when it calls a function with a string argument
 // stored from a table/similar (ie; the prefix check code).
 // If it's not copying anything, we can add request-side functions to do most
@@ -1401,17 +1420,17 @@ int proxy_register_libs(LIBEVENT_THREAD *t, void *ctx) {
         {NULL, NULL}
     };
 
-    // TODO: __gc
     const struct luaL_Reg mcplib_request_m[] = {
         {"command", mcplib_request_command},
         {"key", mcplib_request_key},
         {"__tostring", NULL},
+        {"__gc", mcplib_request_gc},
         {NULL, NULL}
     };
 
-    // TODO: __gc
     const struct luaL_Reg mcplib_response_m[] = {
         {"ok", mcplib_response_ok},
+        {"__gc", mcplib_response_gc},
         {NULL, NULL}
     };
 
