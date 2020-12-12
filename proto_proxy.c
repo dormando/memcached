@@ -1275,8 +1275,8 @@ static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
             }
             break;
         case 3:
-            if (cm[0] == 'g') {
-
+            if (cm[0] == 'g' && cm[1] == 'e' && cm[2] == 't') {
+                cmd = CMD_GET;
             } else if (cm[0] == 's' && cm[1] == 'e' && cm[2] == 't') {
                 // see mcmc.c's _mcmc_parse_value_line() for the trick
                 // set <key> <flags> <exptime> <bytes> [noreply]\r\n
@@ -1321,6 +1321,11 @@ static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
                 rq->vlen = vlen;
                 // TODO: if next byte has a space, we check for noreply.
                 // TODO: ensure last character is \r
+            }
+            break;
+        case 6:
+            if (strncmp(cm, "delete", 6) == 0) {
+                cmd = CMD_DELETE;
             }
             break;
     }
