@@ -627,15 +627,15 @@ void proxy_complete_cb(void *ctx, void *ctx_stack) {
             do_cache_free(p->c->thread->io_cache, p);
             // *p is now dead.
             mcp_queue_io(c, c->thread->L, Lc);
-            printf("C: yield from completed: %d\n", nresults);
-            dump_stack(Lc);
+            //printf("C: yield from completed: %d\n", nresults);
+            //dump_stack(Lc);
         } else {
             // error?
             fprintf(stderr, "Failed to run coroutine: %s\n", lua_tostring(Lc, -1));
             // TODO: send generic ERROR and stop here. Also I know the length
             // is wrong :)
-            memcpy(resp->wbuf, "SERVER_ERROR lua failure\r\n", 15);
-            resp_add_iov(resp, resp->wbuf, 15);
+            memcpy(resp->wbuf, "SERVER_ERROR lua failure\r\n", 27);
+            resp_add_iov(resp, resp->wbuf, 27);
         }
 
         p = next;
@@ -762,7 +762,7 @@ void complete_nread_proxy(conn *c) {
         }
     } else if (cores == LUA_YIELD) {
         // NOTE: this is returning "self" somehow. not sure if it matters.
-        dump_stack(Lc);
+        //dump_stack(Lc);
         // This holds a reference to Lc so it can be resumed on this thread
         // later. Lc itself holds references to server/request data.
         mcp_queue_io(c, L, Lc);
@@ -770,8 +770,8 @@ void complete_nread_proxy(conn *c) {
         // error?
         fprintf(stderr, "Failed to run coroutine: %s\n", lua_tostring(Lc, -1));
         // TODO: send generic ERROR and stop here.
-        memcpy(resp->wbuf, "SERVER_ERROR lua failure\r\n", 15);
-        resp_add_iov(resp, resp->wbuf, 15);
+        memcpy(resp->wbuf, "SERVER_ERROR lua failure\r\n", 27);
+        resp_add_iov(resp, resp->wbuf, 27);
     }
 
     return;
@@ -854,7 +854,7 @@ static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
         }
     } else if (cores == LUA_YIELD) {
         // NOTE: this is returning "self" somehow. not sure if it matters.
-        dump_stack(Lc);
+        //dump_stack(Lc);
         // This holds a reference to Lc so it can be resumed on this thread
         // later. Lc itself holds references to server/request data.
         mcp_queue_io(c, L, Lc);
@@ -862,8 +862,8 @@ static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
         // error?
         fprintf(stderr, "Failed to run coroutine: %s\n", lua_tostring(Lc, -1));
         // TODO: send generic ERROR and stop here.
-        memcpy(resp->wbuf, "SERVER_ERROR lua failure\r\n", 15);
-        resp_add_iov(resp, resp->wbuf, 15);
+        memcpy(resp->wbuf, "SERVER_ERROR lua failure\r\n", 27);
+        resp_add_iov(resp, resp->wbuf, 27);
     }
 
     /*printf("main thread stack:\n");
@@ -942,7 +942,7 @@ static void mcp_queue_io(conn *c, lua_State *L, lua_State *Lc) {
     return;
 }
 
-static void dump_stack(lua_State *L) {
+__attribute__((unused)) static void dump_stack(lua_State *L) {
     int top = lua_gettop(L);
     int i = 1;
     printf("--TOP OF STACK [%d]\n", top);
@@ -1017,7 +1017,7 @@ static int mcplib_server(lua_State *L) {
         s->connecting = true;
         s->can_write = false;
     } else {
-        fprintf(stderr, "Failed to connect to memcached: %s:%s\n", s->ip, s->port);
+        fprintf(stderr, "Failed to connect to backend: %s:%s\n", s->ip, s->port);
         // FIXME: propagate error.
     }
 
