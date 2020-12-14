@@ -108,12 +108,13 @@ struct _io_pending_proxy_t {
     bool flushed; // whether we've fully written this request to a backend.
 };
 
-static void process_proxy_command(conn *c, char *command, size_t cmdlen);
+static void proxy_process_command(conn *c, char *command, size_t cmdlen);
 static void dump_stack(lua_State *L);
 static void mcp_queue_io(conn *c, int coro_ref, lua_State *Lc);
 static mcp_request_t *mcp_new_request(lua_State *L, char *command, size_t cmdlen);
 static void proxy_server_handler(const int fd, const short which, void *arg);
 static void proxy_out_errstring(conn *c, const char *str);
+static int _flush_pending_write(mcp_server_t *s, io_pending_proxy_t *p);
 
 // -------------- EXTERNAL FUNCTIONS
 
@@ -156,341 +157,6 @@ void proxy_thread_init(LIBEVENT_THREAD *thr) {
         fprintf(stderr, "Failed to execute mcp_config_routes: %s\n", lua_tostring(L, -1));
         exit(EXIT_FAILURE);
     }
-}
-
-// TODO:
-// - mcp_server_read: grab req_stack_head, do things
-// read -> next, want_read -> next | read_end, etc.
-// issue: want read back to read_end as necessary. special state?
-//   - it's fine: p->client_resp->type.
-// - mcp_server_next: advance, consume, etc.
-// FIXME: move this. it's not a public function.
-static int proxy_server_drive_machine(mcp_server_t *s) {
-    bool stop = false;
-    io_pending_proxy_t *p = NULL;
-    mcmc_resp_t tmp_resp; // helper for testing for GET's END marker.
-    int flags = 0;
-
-    while (!stop) {
-        mcp_resp_t *r;
-        int res = 1;
-        int remain = 0;
-        int status = 0;
-        char *newbuf = NULL;
-
-    switch(s->state) {
-        case mcp_server_read:
-            p = s->req_stack_head;
-            assert(p != NULL);
-            // FIXME: get the buffer from thread?
-            if (s->rbuf == NULL) {
-                s->rbuf = malloc(READ_BUFFER_SIZE);
-            }
-            // TODO: check rbuf.
-            r = p->client_resp;
-
-            r->status = mcmc_read(s->client, s->rbuf, READ_BUFFER_SIZE, &r->resp);
-            if (r->status != MCMC_OK) {
-                // TODO: ??? reduce io_pending and break?
-                // TODO: check for WANT_READ and re-add the event.
-            }
-
-            // we actually don't care about anything other than the value length
-            // for now.
-            // TODO: if vlen != vlen_read, pull an item and copy the data.
-            int extra_space = 0;
-            switch (r->resp.type) {
-                case MCMC_RESP_GET:
-                    // We're in GET mode. we only support one key per
-                    // GET in the proxy backends, so we need to later check
-                    // for an END.
-                    extra_space = ENDLEN;
-                    break;
-                case MCMC_RESP_END:
-                    // this is a MISS from a GET request
-                    // or final handler from a STAT request.
-                    assert(r->resp.vlen == 0);
-                    break;
-                case MCMC_RESP_META:
-                    // we can handle meta responses easily since they're self
-                    // contained.
-                    break;
-                case MCMC_RESP_GENERIC:
-                    break;
-                // TODO: No-op response?
-                default:
-                    // unhandled :(
-                    // TODO: set the status code properly?
-                    res = 0;
-                    fprintf(stderr, "UNHANDLED: %d\n", r->resp.type);
-                    break;
-            }
-
-            if (res) {
-                // r->resp.reslen + r->resp.vlen is the total length of the response.
-                // TODO: need to associate a buffer with this response...
-                // for now lets abuse write_and_free on mc_resp and simply malloc the
-                // space we need, stuffing it into the resp object.
-                // how will lua be able to generate a fake response tho?
-                // TODO: if item is large enough (or not fully read), allocate
-                // an item and copy into it or try an immediate read.
-                // need to stop and re-schedule the event if not enough data.
-
-                r->blen = r->resp.reslen + r->resp.vlen;
-                r->buf = malloc(r->blen + extra_space);
-                // TODO: check buf. but also avoid the malloc via slab alloc.
-
-                if (r->resp.vlen == r->resp.vlen_read) {
-                    // TODO: some mcmc func for pulling the whole buffer?
-                    memcpy(r->buf, s->rbuf, r->blen);
-                } else {
-                    // TODO: mcmc func for pulling the res off the buffer?
-                    memcpy(r->buf, s->rbuf, r->resp.reslen);
-                    // got a partial read on the value, pull in the rest.
-                    r->bread = 0;
-                    status = mcmc_read_value(s->client, r->buf+r->resp.reslen, r->resp.vlen, &r->bread);
-                    if (status == MCMC_OK) {
-                        // all done copying data.
-                    } else if (status == MCMC_WANT_READ) {
-                        // need to retry later.
-                        s->state = mcp_server_want_read;
-                        flags |= EV_READ;
-                        stop = true;
-                        break;
-                        // TODO: stream larger values' chunks?
-                    } else {
-                        // TODO: error handling.
-                    }
-                }
-            } else {
-                // TODO: no response read?
-            }
-
-            if (r->resp.type == MCMC_RESP_GET) {
-                s->state = mcp_server_read_end;
-            } else {
-                s->state = mcp_server_next;
-            }
-
-            break;
-        case mcp_server_read_end:
-            p = s->req_stack_head;
-            r = p->client_resp;
-            // we need to advance the buffer and ensure the next data
-            // in the stream is "END\r\n"
-            // if not, the stack is desynced and we lose it.
-            newbuf = mcmc_buffer_consume(s->client, &remain);
-
-            if (remain > ENDLEN) {
-                // enough bytes in the buffer for our potential END
-                // marker, so lets avoid an unnecessary memmove.
-            } else if (remain != 0) {
-                // TODO: don't necessarily need to shovel the buffer.
-                memmove(s->rbuf, newbuf, remain);
-                newbuf = s->rbuf;
-            } else {
-                newbuf = s->rbuf;
-            }
-
-            // TODO: WANT_READ can happen here.
-            status = mcmc_read(s->client, newbuf, READ_BUFFER_SIZE-remain, &tmp_resp);
-            if (status != MCMC_OK) {
-                // TODO: something?
-            } else if (tmp_resp.type != MCMC_RESP_END) {
-                // TODO: protocol is desynced, need to dump queue.
-            } else {
-                // response is good.
-                // FIXME: copy what the server actually sent?
-                memcpy(r->buf+r->blen, ENDSTR, ENDLEN);
-                r->blen += 5;
-            }
-
-            s->state = mcp_server_next;
-
-            break;
-        case mcp_server_want_read:
-            // Continuing a read from earlier
-            p = s->req_stack_head;
-            r = p->client_resp;
-            status = mcmc_read_value(s->client, r->buf+r->resp.reslen, r->resp.vlen, &r->bread);
-            if (status == MCMC_OK) {
-                // all done copying data.
-                if (r->resp.type == MCMC_RESP_GET) {
-                    s->state = mcp_server_read_end;
-                } else {
-                    s->state = mcp_server_next;
-                }
-            } else if (status == MCMC_WANT_READ) {
-                // need to retry later.
-                flags |= EV_READ;
-                stop = true;
-            } else {
-                // TODO: error handling.
-            }
-
-            break;
-        case mcp_server_next:
-            // set the head here. when we break the head will be correct.
-            s->req_stack_head = p->server_next;
-            if (s->req_stack_tail == p) {
-                // TODO: suspicious of this code. audit harder?
-                s->req_stack_tail = NULL;
-                stop = true;
-                assert(s->req_stack_head == NULL);
-            }
-
-            // have to do the q->count-- and == 0 and redispatch_conn()
-            // stuff here. The moment we call that write we
-            // don't own *p anymore.
-            p->q->count--;
-            if (p->q->count == 0) {
-                redispatch_conn(p->c);
-            }
-
-            // mcmc_buffer_consume() - if leftover, keep processing
-            // IO's.
-            // if no more data in buffer, need to re-set stack head and re-set
-            // event.
-            remain = 0;
-            // TODO: do we need to yield every N reads?
-            newbuf = mcmc_buffer_consume(s->client, &remain);
-            if (remain != 0) {
-                // data trailing in the buffer, for a different request.
-                memmove(s->rbuf, newbuf, remain);
-            } else {
-                // TODO: signal back to read?
-                stop = true;
-            }
-
-            s->state = mcp_server_read;
-            // TODO: stop if req_stack_head is empty now?
-
-            break;
-        default:
-            fprintf(stderr, "invalid state: %d\n", s->state);
-            assert(false);
-    } // switch
-    } // while
-
-    return flags;
-}
-
-// FIXME: move this. not a public function.
-// TODO: this function is incomplete:
-// - error propagation
-static int _flush_pending_write(mcp_server_t *s, io_pending_proxy_t *p) {
-    int flags = 0;
-
-    if (p->flushed) {
-        return 0;
-    }
-
-    ssize_t sent = 0;
-    // FIXME: original send function internally tracked how much was sent, but
-    // doing this here would require copying all of the iovecs or modify what
-    // we supply.
-    // this is probably okay but I want to leave a note here in case I get a
-    // better idea.
-    int status = mcmc_request_writev(s->client, p->iov, p->iovcnt, &sent, 1);
-    if (sent > 0) {
-        // we need to save progress in case of WANT_WRITE.
-        for (int x = 0; x < p->iovcnt; x++) {
-            struct iovec *iov = &p->iov[x];
-            if (sent >= iov->iov_len) {
-                sent -= iov->iov_len;
-                iov->iov_len = 0;
-            } else {
-                iov->iov_len -= sent;
-                sent = 0;
-                break;
-            }
-        }
-    }
-
-    // request_writev() returns WANT_WRITE if we haven't fully flushed.
-    if (status == MCMC_WANT_WRITE) {
-        // avoid syscalls for any other queued requests.
-        s->can_write = false;
-        flags |= EV_WRITE;
-        return flags; // can't continue for now.
-    } else if (status != MCMC_OK) {
-        // TODO: error propagation.
-        // s->error = code?
-        return 0;
-    } else {
-        p->flushed = true;
-    }
-
-    flags |= EV_READ;
-
-    return flags;
-}
-
-// FIXME: move this. not a public function.
-// The libevent callback handler.
-static void proxy_server_handler(const int fd, const short which, void *arg) {
-    mcp_server_t *s = arg;
-    int flags = EV_TIMEOUT;
-    // TODO: since this is worker-inline only, we're pulling the event base
-    // from the requests. when bg pool owns servers this will change.
-    struct timeval tmp_time = {5,0}; // FIXME: temporary hard coded response timeout.
-
-    if (which & EV_READ) {
-        flags |= proxy_server_drive_machine(s);
-        // TODO: need to re-add the read event if the stack isn't NULL
-    }
-
-    // allow dequeuing anything ready to be read before we process EV_TIMEOUT;
-    // though it might not be possible for both to fire.
-    if (which & EV_TIMEOUT) {
-        // TODO: walk stack and set timeout status on each object.
-        // then return.
-    }
-
-    if (which & EV_WRITE) {
-        s->can_write = true;
-        if (s->connecting) {
-            int err = 0;
-            // We were connecting, now ensure we're properly connected.
-            if (mcmc_check_nonblock_connect(s->client, &err) != MCMC_OK) {
-                // TODO: for now we kill the stack. need to retry a few times
-                // first.
-                // TODO: will need a mechanism for max retries, waits between
-                // fast-fails, and failing the stack equivalent to a timeout.
-            }
-
-        }
-        io_pending_proxy_t *p = s->req_stack_head;
-        while (p) {
-            io_pending_proxy_t *next_p = p->server_next;
-            flags |= _flush_pending_write(s, p);
-            p = next_p;
-        }
-    }
-
-    // Still pending requests to read or write.
-    // TODO: as noted above, we're pulling the event base from a random
-    // connection and reusing it, as this work is currently done inline with
-    // the worker always.
-    // the base should be copied to the server object which should be future
-    // proof.
-    // TODO: need to handle errors from above so we don't go to sleep here.
-    if (s->req_stack_head != NULL) {
-        // set the event.
-        int pending = 0;
-        if (event_initialized(&s->event)) {
-            pending = event_pending(&s->event, EV_READ|EV_WRITE|EV_TIMEOUT, NULL);
-        }
-        if ((pending & (EV_READ|EV_WRITE)) == 0) {
-            if (pending & EV_TIMEOUT) {
-                event_del(&s->event); // in case there's an EV_TIMEOUT already.
-            }
-            event_assign(&s->event, s->req_stack_head->c->thread->base, mcmc_fd(s->client),
-                    flags, proxy_server_handler, s);
-            event_add(&s->event, &tmp_time);
-        }
-    }
-
 }
 
 // ctx_stack is a stack of io_pending_proxy_t's.
@@ -725,7 +391,7 @@ int try_read_command_proxy(conn *c) {
     assert(cont <= (c->rcurr + c->rbytes));
 
     c->last_cmd_time = current_time;
-    process_proxy_command(c, c->rcurr, cont - c->rcurr);
+    proxy_process_command(c, c->rcurr, cont - c->rcurr);
 
     c->rbytes -= (cont - c->rcurr);
     c->rcurr = cont;
@@ -856,8 +522,339 @@ static void proxy_lua_ferror(lua_State *L, const char *fmt, ...) {
     lua_error(L);
 }
 
-// FIXME: proxy_process_command()
-static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
+// TODO:
+// - mcp_server_read: grab req_stack_head, do things
+// read -> next, want_read -> next | read_end, etc.
+// issue: want read back to read_end as necessary. special state?
+//   - it's fine: p->client_resp->type.
+// - mcp_server_next: advance, consume, etc.
+static int proxy_server_drive_machine(mcp_server_t *s) {
+    bool stop = false;
+    io_pending_proxy_t *p = NULL;
+    mcmc_resp_t tmp_resp; // helper for testing for GET's END marker.
+    int flags = 0;
+
+    while (!stop) {
+        mcp_resp_t *r;
+        int res = 1;
+        int remain = 0;
+        int status = 0;
+        char *newbuf = NULL;
+
+    switch(s->state) {
+        case mcp_server_read:
+            p = s->req_stack_head;
+            assert(p != NULL);
+            // FIXME: get the buffer from thread?
+            if (s->rbuf == NULL) {
+                s->rbuf = malloc(READ_BUFFER_SIZE);
+            }
+            // TODO: check rbuf.
+            r = p->client_resp;
+
+            r->status = mcmc_read(s->client, s->rbuf, READ_BUFFER_SIZE, &r->resp);
+            if (r->status != MCMC_OK) {
+                // TODO: ??? reduce io_pending and break?
+                // TODO: check for WANT_READ and re-add the event.
+            }
+
+            // we actually don't care about anything other than the value length
+            // for now.
+            // TODO: if vlen != vlen_read, pull an item and copy the data.
+            int extra_space = 0;
+            switch (r->resp.type) {
+                case MCMC_RESP_GET:
+                    // We're in GET mode. we only support one key per
+                    // GET in the proxy backends, so we need to later check
+                    // for an END.
+                    extra_space = ENDLEN;
+                    break;
+                case MCMC_RESP_END:
+                    // this is a MISS from a GET request
+                    // or final handler from a STAT request.
+                    assert(r->resp.vlen == 0);
+                    break;
+                case MCMC_RESP_META:
+                    // we can handle meta responses easily since they're self
+                    // contained.
+                    break;
+                case MCMC_RESP_GENERIC:
+                    break;
+                // TODO: No-op response?
+                default:
+                    // unhandled :(
+                    // TODO: set the status code properly?
+                    res = 0;
+                    fprintf(stderr, "UNHANDLED: %d\n", r->resp.type);
+                    break;
+            }
+
+            if (res) {
+                // r->resp.reslen + r->resp.vlen is the total length of the response.
+                // TODO: need to associate a buffer with this response...
+                // for now lets abuse write_and_free on mc_resp and simply malloc the
+                // space we need, stuffing it into the resp object.
+                // how will lua be able to generate a fake response tho?
+                // TODO: if item is large enough (or not fully read), allocate
+                // an item and copy into it or try an immediate read.
+                // need to stop and re-schedule the event if not enough data.
+
+                r->blen = r->resp.reslen + r->resp.vlen;
+                r->buf = malloc(r->blen + extra_space);
+                // TODO: check buf. but also avoid the malloc via slab alloc.
+
+                if (r->resp.vlen == r->resp.vlen_read) {
+                    // TODO: some mcmc func for pulling the whole buffer?
+                    memcpy(r->buf, s->rbuf, r->blen);
+                } else {
+                    // TODO: mcmc func for pulling the res off the buffer?
+                    memcpy(r->buf, s->rbuf, r->resp.reslen);
+                    // got a partial read on the value, pull in the rest.
+                    r->bread = 0;
+                    status = mcmc_read_value(s->client, r->buf+r->resp.reslen, r->resp.vlen, &r->bread);
+                    if (status == MCMC_OK) {
+                        // all done copying data.
+                    } else if (status == MCMC_WANT_READ) {
+                        // need to retry later.
+                        s->state = mcp_server_want_read;
+                        flags |= EV_READ;
+                        stop = true;
+                        break;
+                        // TODO: stream larger values' chunks?
+                    } else {
+                        // TODO: error handling.
+                    }
+                }
+            } else {
+                // TODO: no response read?
+            }
+
+            if (r->resp.type == MCMC_RESP_GET) {
+                s->state = mcp_server_read_end;
+            } else {
+                s->state = mcp_server_next;
+            }
+
+            break;
+        case mcp_server_read_end:
+            p = s->req_stack_head;
+            r = p->client_resp;
+            // we need to advance the buffer and ensure the next data
+            // in the stream is "END\r\n"
+            // if not, the stack is desynced and we lose it.
+            newbuf = mcmc_buffer_consume(s->client, &remain);
+
+            if (remain > ENDLEN) {
+                // enough bytes in the buffer for our potential END
+                // marker, so lets avoid an unnecessary memmove.
+            } else if (remain != 0) {
+                // TODO: don't necessarily need to shovel the buffer.
+                memmove(s->rbuf, newbuf, remain);
+                newbuf = s->rbuf;
+            } else {
+                newbuf = s->rbuf;
+            }
+
+            // TODO: WANT_READ can happen here.
+            status = mcmc_read(s->client, newbuf, READ_BUFFER_SIZE-remain, &tmp_resp);
+            if (status != MCMC_OK) {
+                // TODO: something?
+            } else if (tmp_resp.type != MCMC_RESP_END) {
+                // TODO: protocol is desynced, need to dump queue.
+            } else {
+                // response is good.
+                // FIXME: copy what the server actually sent?
+                memcpy(r->buf+r->blen, ENDSTR, ENDLEN);
+                r->blen += 5;
+            }
+
+            s->state = mcp_server_next;
+
+            break;
+        case mcp_server_want_read:
+            // Continuing a read from earlier
+            p = s->req_stack_head;
+            r = p->client_resp;
+            status = mcmc_read_value(s->client, r->buf+r->resp.reslen, r->resp.vlen, &r->bread);
+            if (status == MCMC_OK) {
+                // all done copying data.
+                if (r->resp.type == MCMC_RESP_GET) {
+                    s->state = mcp_server_read_end;
+                } else {
+                    s->state = mcp_server_next;
+                }
+            } else if (status == MCMC_WANT_READ) {
+                // need to retry later.
+                flags |= EV_READ;
+                stop = true;
+            } else {
+                // TODO: error handling.
+            }
+
+            break;
+        case mcp_server_next:
+            // set the head here. when we break the head will be correct.
+            s->req_stack_head = p->server_next;
+            if (s->req_stack_tail == p) {
+                // TODO: suspicious of this code. audit harder?
+                s->req_stack_tail = NULL;
+                stop = true;
+                assert(s->req_stack_head == NULL);
+            }
+
+            // have to do the q->count-- and == 0 and redispatch_conn()
+            // stuff here. The moment we call that write we
+            // don't own *p anymore.
+            p->q->count--;
+            if (p->q->count == 0) {
+                redispatch_conn(p->c);
+            }
+
+            // mcmc_buffer_consume() - if leftover, keep processing
+            // IO's.
+            // if no more data in buffer, need to re-set stack head and re-set
+            // event.
+            remain = 0;
+            // TODO: do we need to yield every N reads?
+            newbuf = mcmc_buffer_consume(s->client, &remain);
+            if (remain != 0) {
+                // data trailing in the buffer, for a different request.
+                memmove(s->rbuf, newbuf, remain);
+            } else {
+                // TODO: signal back to read?
+                stop = true;
+            }
+
+            s->state = mcp_server_read;
+            // TODO: stop if req_stack_head is empty now?
+
+            break;
+        default:
+            fprintf(stderr, "invalid state: %d\n", s->state);
+            assert(false);
+    } // switch
+    } // while
+
+    return flags;
+}
+
+// TODO: this function is incomplete:
+// - error propagation
+static int _flush_pending_write(mcp_server_t *s, io_pending_proxy_t *p) {
+    int flags = 0;
+
+    if (p->flushed) {
+        return 0;
+    }
+
+    ssize_t sent = 0;
+    // FIXME: original send function internally tracked how much was sent, but
+    // doing this here would require copying all of the iovecs or modify what
+    // we supply.
+    // this is probably okay but I want to leave a note here in case I get a
+    // better idea.
+    int status = mcmc_request_writev(s->client, p->iov, p->iovcnt, &sent, 1);
+    if (sent > 0) {
+        // we need to save progress in case of WANT_WRITE.
+        for (int x = 0; x < p->iovcnt; x++) {
+            struct iovec *iov = &p->iov[x];
+            if (sent >= iov->iov_len) {
+                sent -= iov->iov_len;
+                iov->iov_len = 0;
+            } else {
+                iov->iov_len -= sent;
+                sent = 0;
+                break;
+            }
+        }
+    }
+
+    // request_writev() returns WANT_WRITE if we haven't fully flushed.
+    if (status == MCMC_WANT_WRITE) {
+        // avoid syscalls for any other queued requests.
+        s->can_write = false;
+        flags |= EV_WRITE;
+        return flags; // can't continue for now.
+    } else if (status != MCMC_OK) {
+        // TODO: error propagation.
+        // s->error = code?
+        return 0;
+    } else {
+        p->flushed = true;
+    }
+
+    flags |= EV_READ;
+
+    return flags;
+}
+
+// The libevent callback handler.
+static void proxy_server_handler(const int fd, const short which, void *arg) {
+    mcp_server_t *s = arg;
+    int flags = EV_TIMEOUT;
+    // TODO: since this is worker-inline only, we're pulling the event base
+    // from the requests. when bg pool owns servers this will change.
+    struct timeval tmp_time = {5,0}; // FIXME: temporary hard coded response timeout.
+
+    if (which & EV_READ) {
+        flags |= proxy_server_drive_machine(s);
+        // TODO: need to re-add the read event if the stack isn't NULL
+    }
+
+    // allow dequeuing anything ready to be read before we process EV_TIMEOUT;
+    // though it might not be possible for both to fire.
+    if (which & EV_TIMEOUT) {
+        // TODO: walk stack and set timeout status on each object.
+        // then return.
+    }
+
+    if (which & EV_WRITE) {
+        s->can_write = true;
+        if (s->connecting) {
+            int err = 0;
+            // We were connecting, now ensure we're properly connected.
+            if (mcmc_check_nonblock_connect(s->client, &err) != MCMC_OK) {
+                // TODO: for now we kill the stack. need to retry a few times
+                // first.
+                // TODO: will need a mechanism for max retries, waits between
+                // fast-fails, and failing the stack equivalent to a timeout.
+            }
+
+        }
+        io_pending_proxy_t *p = s->req_stack_head;
+        while (p) {
+            io_pending_proxy_t *next_p = p->server_next;
+            flags |= _flush_pending_write(s, p);
+            p = next_p;
+        }
+    }
+
+    // Still pending requests to read or write.
+    // TODO: as noted above, we're pulling the event base from a random
+    // connection and reusing it, as this work is currently done inline with
+    // the worker always.
+    // the base should be copied to the server object which should be future
+    // proof.
+    // TODO: need to handle errors from above so we don't go to sleep here.
+    if (s->req_stack_head != NULL) {
+        // set the event.
+        int pending = 0;
+        if (event_initialized(&s->event)) {
+            pending = event_pending(&s->event, EV_READ|EV_WRITE|EV_TIMEOUT, NULL);
+        }
+        if ((pending & (EV_READ|EV_WRITE)) == 0) {
+            if (pending & EV_TIMEOUT) {
+                event_del(&s->event); // in case there's an EV_TIMEOUT already.
+            }
+            event_assign(&s->event, s->req_stack_head->c->thread->base, mcmc_fd(s->client),
+                    flags, proxy_server_handler, s);
+            event_add(&s->event, &tmp_time);
+        }
+    }
+
+}
+
+static void proxy_process_command(conn *c, char *command, size_t cmdlen) {
     assert(c != NULL);
     LIBEVENT_THREAD *thr = c->thread;
     lua_State *L = thr->L;
