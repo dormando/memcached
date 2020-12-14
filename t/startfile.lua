@@ -179,7 +179,7 @@ function mcp_config_routes(main_zones)
 
     -- TODO: could also wrap routetop with a final failover:
     -- modify the exptime for sets.
-    local routetop = prefix_factory("^/(%a+)/", prefixes, function(r) return "NO ROUTE\r\n" end)
+    local routetop = prefix_factory("^/(%a+)/", prefixes, function(r) return "SERVER_ERROR no route\r\n" end)
     -- internally run parser at top of tree
     -- also wrap the request string with a convenience object until the C bits
     -- are attached to the internal parser.
