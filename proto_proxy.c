@@ -113,7 +113,7 @@ static void dump_stack(lua_State *L);
 static void mcp_queue_io(conn *c, int coro_ref, lua_State *Lc);
 static mcp_request_t *mcp_new_request(lua_State *L, char *command, size_t cmdlen);
 static void proxy_server_handler(const int fd, const short which, void *arg);
-
+static void proxy_out_errstring(conn *c, const char *str);
 
 // -------------- EXTERNAL FUNCTIONS
 
@@ -164,6 +164,7 @@ void proxy_thread_init(LIBEVENT_THREAD *thr) {
 // issue: want read back to read_end as necessary. special state?
 //   - it's fine: p->client_resp->type.
 // - mcp_server_next: advance, consume, etc.
+// FIXME: move this. it's not a public function.
 static int proxy_server_drive_machine(mcp_server_t *s) {
     bool stop = false;
     io_pending_proxy_t *p = NULL;
@@ -374,6 +375,7 @@ static int proxy_server_drive_machine(mcp_server_t *s) {
     return flags;
 }
 
+// FIXME: move this. not a public function.
 // TODO: this function is incomplete:
 // - error propagation
 static int _flush_pending_write(mcp_server_t *s, io_pending_proxy_t *p) {
@@ -424,6 +426,7 @@ static int _flush_pending_write(mcp_server_t *s, io_pending_proxy_t *p) {
     return flags;
 }
 
+// FIXME: move this. not a public function.
 // The libevent callback handler.
 static void proxy_server_handler(const int fd, const short which, void *arg) {
     mcp_server_t *s = arg;
@@ -667,6 +670,7 @@ void proxy_finalize_cb(io_pending_t *pending) {
     // TODO: coroutines are reusable in latest lua. we can stack this onto a freelist
     // after a lua_resetthread(Lc) call.
     if (p->coro_ref) {
+        // Note: lua registry is the same for main thread or a coroutine.
         luaL_unref(p->coro, LUA_REGISTRYINDEX, p->coro_ref);
     }
     return;
@@ -797,6 +801,62 @@ void complete_nread_proxy(conn *c) {
 
 /******** END PUBLIC COMMANDS ******/
 
+// Need a custom function so we can prefix lua strings easily.
+// TODO: can this be made not-necessary somehow?
+static void proxy_out_errstring(conn *c, const char *str) {
+    size_t len;
+    const static char error_prefix[] = "SERVER_ERROR ";
+    const static int error_prefix_len = sizeof(error_prefix) - 1;
+
+    assert(c != NULL);
+    mc_resp *resp = c->resp;
+
+    resp_reset(resp);
+    // avoid noreply since we're throwing important errors.
+
+    if (settings.verbose > 1)
+        fprintf(stderr, ">%d %s\n", c->sfd, str);
+
+    // Fill response object with static string.
+
+    len = strlen(str);
+    if ((len + error_prefix_len + 2) > WRITE_BUFFER_SIZE) {
+        /* ought to be always enough. just fail for simplicity */
+        str = "SERVER_ERROR output line too long";
+        len = strlen(str);
+    }
+
+    char *w = resp->wbuf;
+    memcpy(w, error_prefix, error_prefix_len);
+    w += error_prefix_len;
+
+    memcpy(w, str, len);
+    w += len;
+
+    memcpy(w, "\r\n", 2);
+    resp_add_iov(resp, resp->wbuf, len + error_prefix_len + 2);
+
+    conn_set_state(c, conn_new_cmd);
+    return;
+}
+
+// Simple error wrapper for common failures.
+// lua_error() is a jump so this function never returns
+// for clarity add a 'return' after calls to this.
+static void proxy_lua_error(lua_State *L, const char *s) {
+    lua_pushstring(L, s);
+    lua_error(L);
+}
+
+static void proxy_lua_ferror(lua_State *L, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    lua_pushfstring(L, fmt, ap);
+    va_end(ap);
+    lua_error(L);
+}
+
+// FIXME: proxy_process_command()
 static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
     assert(c != NULL);
     LIBEVENT_THREAD *thr = c->thread;
@@ -804,13 +864,7 @@ static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
 
     MEMCACHED_PROCESS_COMMAND_START(c->sfd, c->rcurr, c->rbytes);
 
-    if (settings.verbose > 1)
-        fprintf(stderr, "<%d %s\n", c->sfd, command);
-
-    /*
-     * for commands set/add/replace, we build an item and read the data
-     * directly into it, then continue in nread_complete().
-     */
+    // TODO: logger integration!
 
     // Prep the response object for this query.
     // TODO: Kill this line and dynamically pull them instead?
@@ -830,6 +884,7 @@ static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
 
     // FIXME: think we need to parse the request before looking at attach, so
     // we can attach to specific commands properly?
+    // TODO: split parse from new request.
     mcp_request_t *rq = mcp_new_request(Lc, command, cmdlen);
     // TODO: a better indicator of needing nread.
     // TODO: lift this to a post-processor?
@@ -838,7 +893,9 @@ static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
         // fragmentation.
         c->item = malloc(rq->vlen);
         if (c->item == NULL) {
-            // TODO: error handling.
+            lua_settop(L, 0);
+            proxy_out_errstring(c, "out of memory");
+            return;
         }
         c->item_malloced = true;
         c->ritem = c->item;
@@ -846,8 +903,8 @@ static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
 
         conn_set_state(c, conn_nread);
 
-        // FIXME: need to stash the coroutine ptr?
-        // should still be on (thr->L, -1)
+        // thread coroutine is still on (L, -1)
+        // FIXME: could get speedup from stashing Lc ptr.
         return;
     }
 
@@ -879,19 +936,12 @@ static void process_proxy_command(conn *c, char *command, size_t cmdlen) {
         int coro_ref = luaL_ref(L, LUA_REGISTRYINDEX);
         mcp_queue_io(c, coro_ref, Lc);
     } else {
-        // error?
-        fprintf(stderr, "PFailed to run coroutine: %s\n", lua_tostring(Lc, -1));
-        // TODO: send generic ERROR and stop here.
-        memcpy(resp->wbuf, "SERVER_ERROR lua failure\r\n", 27);
-        resp_add_iov(resp, resp->wbuf, 27);
+        // TODO: Should we be shipping a generic error to client and a
+        // specific error to logger?
+        proxy_out_errstring(c, lua_tostring(Lc, -1));
     }
 
     lua_settop(L, 0); // clear anything remaining on the main thread.
-
-    /*printf("main thread stack:\n");
-    dump_stack(L);
-    printf("\ncoroutine thread stack:\n");
-    dump_stack(Lc);*/
 }
 
 // analogue for storage_get_item(); add a deferred IO object to the current
@@ -913,6 +963,10 @@ static void mcp_queue_io(conn *c, int coro_ref, lua_State *Lc) {
     // Then we push a response object, which we'll re-use later.
     // reserve one uservalue for a lua-supplied response.
     mcp_resp_t *r = lua_newuserdatauv(Lc, sizeof(mcp_resp_t), 1);
+    if (r == NULL) {
+        proxy_lua_error(Lc, "out of memory allocating response");
+        return;
+    }
     // TODO: check *r
     r->buf = NULL;
     r->blen = 0;
@@ -1022,7 +1076,10 @@ static int mcplib_server(lua_State *L) {
 
     // This might shift to internal objects?
     mcp_server_t *s = lua_newuserdatauv(L, sizeof(mcp_server_t), 0);
-    // TODO: check s
+    if (s == NULL) {
+        proxy_lua_error(L, "out of memory allocating server");
+        return 0;
+    }
     
     strncpy(s->ip, ip, MAX_IPLEN);
     strncpy(s->port, port, MAX_PORTLEN);
@@ -1039,26 +1096,29 @@ static int mcplib_server(lua_State *L) {
 
     // initialize the client
     s->client = malloc(mcmc_size(MCMC_OPTION_BLANK));
+    if (s->client == NULL) {
+        proxy_lua_error(L, "out of memory allocating server");
+        return 0;
+    }
     // TODO: connect elsewhere? Any reason not to immediately shoot off a
     // connect?
     int status = mcmc_connect(s->client, s->ip, s->port, MCMC_OPTION_NONBLOCK);
     if (status == MCMC_CONNECTED) {
         // FIXME: is this possible? do we ever want to allow blocking
         // connections?
-        fprintf(stderr, "Unexpectedly connected to backend early: %s:%s\n", s->ip, s->port);
-        // FIXME: propagate error.
+        proxy_lua_ferror(L, "unexpectedly connected to backend early: %s:%s\n", s->ip, s->port);
+        return 0;
     } else if (status == MCMC_CONNECTING) {
         s->connecting = true;
         s->can_write = false;
     } else {
-        fprintf(stderr, "Failed to connect to backend: %s:%s\n", s->ip, s->port);
-        // FIXME: propagate error.
+        proxy_lua_ferror(L, "failed to connect to backend: %s:%s\n", s->ip, s->port);
+        return 0;
     }
 
     luaL_getmetatable(L, "mcp.server");
     lua_setmetatable(L, -2); // set metatable to userdata.
 
-    //printf("created a new server\n");
     return 1;
 }
 

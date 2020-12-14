@@ -165,50 +165,6 @@ function walkall_factory(pool)
     end
 end
 
-local Request = {__name = "mcp.lua_request"}
---local CommandMap = {
---    get = mcp.REQUEST_GET,
---    set = mcp.REQUEST_SET,
---    delete = mcp.REQUEST_DELETE,
---}
-
--- TODO: optimize: alias string.gmatch, loop for table insert
--- TODO: note if key or string modified and rebuild string during __tostring.
-function Request:new(r)
-    r = {req = r, tokens = {}}
-    -- tokenize the request
-    -- TODO: could optimize by using a more complete parser.
-    -- else requests with lots of tokens (meta commands) are unecessarily
-    -- slow.
-    for t in string.gmatch(r.req, "%S+") do
-        table.insert(r.tokens, t)
-    end
-    r.cmd = CommandMap[r.tokens[1]]
-    self.__index = self
-    setmetatable(r, self)
-    return r
-end
-
-function Request:key(k)
-    if k then
-        self.k = k
-    else
-        if self.k then
-            return self.k
-        else
-            return self.tokens[2]
-        end
-    end
-end
-
-function Request:command()
-    return self.cmd
-end
-
-function Request:__tostring()
-    return self.req
-end
-
 function mcp_config_routes(main_zones)
     -- generate the prefix routes from zones.
     local prefixes = {}
