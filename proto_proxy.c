@@ -116,6 +116,7 @@ static mcp_request_t *mcp_new_request(lua_State *L, char *command, size_t cmdlen
 static void proxy_server_handler(const int fd, const short which, void *arg);
 static void proxy_out_errstring(mc_resp *resp, const char *str);
 static int _flush_pending_write(mcp_server_t *s, io_pending_proxy_t *p);
+static void _set_event(mcp_server_t *s, struct event_base *base, int flags, struct timeval t);
 
 // -------------- EXTERNAL FUNCTIONS
 
@@ -185,30 +186,8 @@ void proxy_submit_cb(void *ctx, void *ctx_stack) {
             // s->can_write should deal with this?
             _flush_pending_write(s, p);
         }
-
-        // FIXME: chicken and egg.
-        // can't check if pending if the structure is was calloc'ed (sigh)
-        // don't want to double test here. should be able to event_assign but
-        // not add anything during initialization, but need the owner thread's
-        // event base.
-        int pending = 0;
-        if (event_initialized(&s->event)) {
-            pending = event_pending(&s->event, EV_READ|EV_WRITE|EV_TIMEOUT, NULL);
-        }
-        if ((pending & (EV_READ|EV_WRITE)) == 0) {
-            if (pending & EV_TIMEOUT) {
-                event_del(&s->event); // in case there's an EV_TIMEOUT already.
-            }
-
-            // if we can't write, we could be connecting.
-            // TODO: always checking for READ in case some commands were sent
-            // successfully. The flags could be tracked on *s and reset in the
-            // handler, perhaps?
-            int flags = s->can_write ? EV_READ|EV_TIMEOUT : EV_READ|EV_WRITE|EV_TIMEOUT;
-            event_assign(&s->event, p->c->thread->base, mcmc_fd(s->client),
-                    flags, proxy_server_handler, s);
-            event_add(&s->event, &tmp_time);
-        }
+        int flags = s->can_write ? EV_READ|EV_TIMEOUT : EV_READ|EV_WRITE|EV_TIMEOUT;
+        _set_event(s, p->c->thread->base, flags, tmp_time);
 
         // stack IO using secondary next ptr. need to guarantee FIFO.
         // this may not always be safe; IO's are "stuck" until processed out
@@ -422,6 +401,31 @@ static void proxy_lua_ferror(lua_State *L, const char *fmt, ...) {
     lua_pushfstring(L, fmt, ap);
     va_end(ap);
     lua_error(L);
+}
+
+static void _set_event(mcp_server_t *s, struct event_base *base, int flags, struct timeval t) {
+    // FIXME: chicken and egg.
+    // can't check if pending if the structure is was calloc'ed (sigh)
+    // don't want to double test here. should be able to event_assign but
+    // not add anything during initialization, but need the owner thread's
+    // event base.
+    int pending = 0;
+    if (event_initialized(&s->event)) {
+        pending = event_pending(&s->event, EV_READ|EV_WRITE|EV_TIMEOUT, NULL);
+    }
+    if ((pending & (EV_READ|EV_WRITE)) == 0) {
+        if (pending & EV_TIMEOUT) {
+            event_del(&s->event); // in case there's an EV_TIMEOUT already.
+        }
+
+        // if we can't write, we could be connecting.
+        // TODO: always checking for READ in case some commands were sent
+        // successfully. The flags could be tracked on *s and reset in the
+        // handler, perhaps?
+        event_assign(&s->event, base, mcmc_fd(s->client),
+                flags, proxy_server_handler, s);
+        event_add(&s->event, &t);
+    }
 }
 
 static int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t *p, conn *c) {
@@ -811,19 +815,7 @@ static void proxy_server_handler(const int fd, const short which, void *arg) {
     // proof.
     // TODO: need to handle errors from above so we don't go to sleep here.
     if (s->req_stack_head != NULL) {
-        // set the event.
-        int pending = 0;
-        if (event_initialized(&s->event)) {
-            pending = event_pending(&s->event, EV_READ|EV_WRITE|EV_TIMEOUT, NULL);
-        }
-        if ((pending & (EV_READ|EV_WRITE)) == 0) {
-            if (pending & EV_TIMEOUT) {
-                event_del(&s->event); // in case there's an EV_TIMEOUT already.
-            }
-            event_assign(&s->event, s->req_stack_head->c->thread->base, mcmc_fd(s->client),
-                    flags, proxy_server_handler, s);
-            event_add(&s->event, &tmp_time);
-        }
+        _set_event(s, s->req_stack_head->c->thread->base, flags, tmp_time);
     }
 
 }
