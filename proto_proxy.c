@@ -108,12 +108,13 @@ struct _io_pending_proxy_t {
     bool flushed; // whether we've fully written this request to a backend.
 };
 
+static int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t *p, conn *c);
 static void proxy_process_command(conn *c, char *command, size_t cmdlen);
 static void dump_stack(lua_State *L);
 static void mcp_queue_io(conn *c, int coro_ref, lua_State *Lc);
 static mcp_request_t *mcp_new_request(lua_State *L, char *command, size_t cmdlen);
 static void proxy_server_handler(const int fd, const short which, void *arg);
-static void proxy_out_errstring(conn *c, const char *str);
+static void proxy_out_errstring(mc_resp *resp, const char *str);
 static int _flush_pending_write(mcp_server_t *s, io_pending_proxy_t *p);
 
 // -------------- EXTERNAL FUNCTIONS
@@ -236,7 +237,7 @@ void proxy_submit_cb(void *ctx, void *ctx_stack) {
 // Flow:
 // - the response object should already be on the coroutine stack.
 // - fix up the stack.
-// - lua_resume()
+// - run coroutine.
 // - if LUA_YIELD, we need to swap out the pending IO from its mc_resp then call for a queue
 // again.
 // - if LUA_OK finalize the response and return
@@ -248,7 +249,6 @@ void proxy_complete_cb(void *ctx, void *ctx_stack) {
 
     while (p) {
         io_pending_proxy_t *next = p->next;
-        int nresults = 0;
         mc_resp *resp = p->resp;
         lua_State *Lc = p->coro;
 
@@ -258,66 +258,9 @@ void proxy_complete_cb(void *ctx, void *ctx_stack) {
         lua_rotate(Lc, 1, 1);
         // We kept the original results from the yield so lua would not
         // collect them in the meantime. We can drop those now.
-        lua_pop(Lc, lua_gettop(Lc)-1);
+        lua_settop(Lc, 1);
 
-        int cores = lua_resume(Lc, NULL, 1, &nresults);
-        size_t rlen = 0;
-
-        if (cores == LUA_OK) {
-            int type = lua_type(Lc, -1);
-            if (type == LUA_TUSERDATA) {
-                mcp_resp_t *r = luaL_checkudata(Lc, -1, "mcp.response");
-                if (r->buf) {
-                    // response set from C.
-                    // FIXME: write_and_free() ? it's a bit wrong for here.
-                    resp->write_and_free = r->buf;
-                    resp_add_iov(resp, r->buf, r->blen);
-                    r->buf = NULL;
-                } else if (lua_getiuservalue(Lc, -1, 1) != LUA_TNONE) {
-                    // response set into lua via an internal.
-                    const char *s = lua_tolstring(Lc, -1, &rlen);
-                    size_t l = rlen > WRITE_BUFFER_SIZE ? WRITE_BUFFER_SIZE : rlen;
-                    memcpy(resp->wbuf, s, l);
-                    resp_add_iov(resp, resp->wbuf, l);
-                    lua_pop(Lc, 1);
-                }
-            } else if (type == LUA_TSTRING) {
-                // response is a raw string from lua.
-                const char *s = lua_tolstring(Lc, -1, &rlen);
-                size_t l = rlen > WRITE_BUFFER_SIZE ? WRITE_BUFFER_SIZE : rlen;
-                memcpy(resp->wbuf, s, l);
-                resp_add_iov(resp, resp->wbuf, l);
-                lua_pop(Lc, 1);
-            } else {
-                memcpy(resp->wbuf, "ERROR\r\n", 7);
-                resp_add_iov(resp, resp->wbuf, 7);
-            }
-
-        } else if (cores == LUA_YIELD) {
-            // need to remove and free the io_pending, since c->resp owns it.
-            // so we call mcp_queue_io() again and let it override the
-            // mc_resp's io_pending object.
-            // FIXME: experimental inline free/reuse of resp here! an
-            // alternative could be to just create mc_resp's with io_pendings
-            // and stack them (but leave resp->skip = true by default).
-            // swapping the pendings here should be a little faster overall
-            // though.
-            //
-            int coro_ref = p->coro_ref;
-            conn *c = p->c;
-            do_cache_free(p->c->thread->io_cache, p);
-            // *p is now dead.
-            mcp_queue_io(c, coro_ref, Lc);
-            //printf("C: yield from completed: %d\n", nresults);
-            //dump_stack(Lc);
-        } else {
-            // error?
-            fprintf(stderr, "CFailed to run coroutine: %s\n", lua_tostring(Lc, -1));
-            // TODO: send generic ERROR and stop here. Also I know the length
-            // is wrong :)
-            memcpy(resp->wbuf, "SERVER_ERROR lua failure\r\n", 27);
-            resp_add_iov(resp, resp->wbuf, 27);
-        }
+        proxy_run_coroutine(Lc, resp, p, NULL);
 
         // don't need to flatten main thread here, since the coro is gone.
 
@@ -423,42 +366,8 @@ void complete_nread_proxy(conn *c) {
     }
     rq->buf = c->item;
     c->item = NULL;
-    int nresults = 0;
 
-    // call the function via coroutine.
-    int cores = lua_resume(Lc, NULL, 1, &nresults);
-    mc_resp *resp = c->resp;
-    size_t rlen = 0;
-
-    if (cores == LUA_OK) {
-        // figure out if we have a response object, raw string, or what.
-        int type = lua_type(Lc, -1);
-
-        if ((type == LUA_TUSERDATA && lua_getiuservalue(Lc, -1, 1) != LUA_TNONE) || type == LUA_TSTRING) {
-            // FIXME: checkudata, testudata? anything to directly check this?
-            const char *s = lua_tolstring(Lc, -1, &rlen);
-            size_t l = rlen > WRITE_BUFFER_SIZE ? WRITE_BUFFER_SIZE : rlen;
-            memcpy(resp->wbuf, s, l);
-            resp_add_iov(resp, resp->wbuf, l);
-            lua_pop(Lc, 1);
-        } else {
-            memcpy(resp->wbuf, "ERROR\r\n", 7);
-            resp_add_iov(resp, resp->wbuf, 7);
-        }
-    } else if (cores == LUA_YIELD) {
-        // NOTE: this is returning "self" somehow. not sure if it matters.
-        //dump_stack(Lc);
-        // This holds a reference to Lc so it can be resumed on this thread
-        // later. Lc itself holds references to server/request data.
-        int coro_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-        mcp_queue_io(c, coro_ref, Lc);
-    } else {
-        // error?
-        fprintf(stderr, "NFailed to run coroutine: %s\n", lua_tostring(Lc, -1));
-        // TODO: send generic ERROR and stop here.
-        memcpy(resp->wbuf, "SERVER_ERROR lua failure\r\n", 27);
-        resp_add_iov(resp, resp->wbuf, 27);
-    }
+    proxy_run_coroutine(Lc, c->resp, NULL, c);
 
     lua_settop(L, 0); // clear anything remaining on the main thread.
 
@@ -469,22 +378,17 @@ void complete_nread_proxy(conn *c) {
 
 // Need a custom function so we can prefix lua strings easily.
 // TODO: can this be made not-necessary somehow?
-static void proxy_out_errstring(conn *c, const char *str) {
+static void proxy_out_errstring(mc_resp *resp, const char *str) {
     size_t len;
     const static char error_prefix[] = "SERVER_ERROR ";
     const static int error_prefix_len = sizeof(error_prefix) - 1;
 
-    assert(c != NULL);
-    mc_resp *resp = c->resp;
+    assert(resp != NULL);
 
     resp_reset(resp);
     // avoid noreply since we're throwing important errors.
 
-    if (settings.verbose > 1)
-        fprintf(stderr, ">%d %s\n", c->sfd, str);
-
     // Fill response object with static string.
-
     len = strlen(str);
     if ((len + error_prefix_len + 2) > WRITE_BUFFER_SIZE) {
         /* ought to be always enough. just fail for simplicity */
@@ -501,8 +405,6 @@ static void proxy_out_errstring(conn *c, const char *str) {
 
     memcpy(w, "\r\n", 2);
     resp_add_iov(resp, resp->wbuf, len + error_prefix_len + 2);
-
-    conn_set_state(c, conn_new_cmd);
     return;
 }
 
@@ -520,6 +422,78 @@ static void proxy_lua_ferror(lua_State *L, const char *fmt, ...) {
     lua_pushfstring(L, fmt, ap);
     va_end(ap);
     lua_error(L);
+}
+
+static int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t *p, conn *c) {
+    int nresults = 0;
+    int cores = lua_resume(Lc, NULL, 1, &nresults);
+    size_t rlen = 0;
+
+    if (cores == LUA_OK) {
+        int type = lua_type(Lc, -1);
+        if (type == LUA_TUSERDATA) {
+            mcp_resp_t *r = luaL_checkudata(Lc, -1, "mcp.response");
+            if (r->buf) {
+                // response set from C.
+                // FIXME: write_and_free() ? it's a bit wrong for here.
+                resp->write_and_free = r->buf;
+                resp_add_iov(resp, r->buf, r->blen);
+                r->buf = NULL;
+            } else if (lua_getiuservalue(Lc, -1, 1) != LUA_TNONE) {
+                // response set into lua via an internal.
+                const char *s = lua_tolstring(Lc, -1, &rlen);
+                size_t l = rlen > WRITE_BUFFER_SIZE ? WRITE_BUFFER_SIZE : rlen;
+                memcpy(resp->wbuf, s, l);
+                resp_add_iov(resp, resp->wbuf, l);
+                lua_pop(Lc, 1);
+            }
+        } else if (type == LUA_TSTRING) {
+            // response is a raw string from lua.
+            const char *s = lua_tolstring(Lc, -1, &rlen);
+            size_t l = rlen > WRITE_BUFFER_SIZE ? WRITE_BUFFER_SIZE : rlen;
+            memcpy(resp->wbuf, s, l);
+            resp_add_iov(resp, resp->wbuf, l);
+            lua_pop(Lc, 1);
+        } else {
+            proxy_out_errstring(resp, "bad response");
+        }
+    } else if (cores == LUA_YIELD) {
+        // need to remove and free the io_pending, since c->resp owns it.
+        // so we call mcp_queue_io() again and let it override the
+        // mc_resp's io_pending object.
+        // FIXME: experimental inline free/reuse of resp here! an
+        // alternative could be to just create mc_resp's with io_pendings
+        // and stack them (but leave resp->skip = true by default).
+        // swapping the pendings here should be a little faster overall
+        // though.
+
+        int coro_ref = 0;
+        if (p != NULL) {
+            coro_ref = p->coro_ref;
+            c = p->c;
+            do_cache_free(p->c->thread->io_cache, p);
+            // *p is now dead.
+        } else {
+            // yielding from a top level call to the coroutine,
+            // so we need to grab a reference to the coroutine thread.
+            // TODO: make this more explicit?
+            // we only need to get the reference here, and error conditions
+            // should instead drop it, but now it's not obvious to users that
+            // we're reaching back into the main thread's stack.
+            assert(c != NULL);
+            coro_ref = luaL_ref(c->thread->L, LUA_REGISTRYINDEX);
+        }
+        mcp_queue_io(c, coro_ref, Lc);
+    } else {
+        // error?
+        fprintf(stderr, "CFailed to run coroutine: %s\n", lua_tostring(Lc, -1));
+        // TODO: send generic ERROR and stop here. Also I know the length
+        // is wrong :)
+        memcpy(resp->wbuf, "SERVER_ERROR lua failure\r\n", 27);
+        resp_add_iov(resp, resp->wbuf, 27);
+    }
+
+    return 0;
 }
 
 // TODO:
@@ -870,7 +844,6 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen) {
         return;
     }
 
-    int nresults = 0;
     // start a coroutine.
     // TODO: This can pull from a cache.
     lua_newthread(L);
@@ -891,7 +864,7 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen) {
         c->item = malloc(rq->vlen);
         if (c->item == NULL) {
             lua_settop(L, 0);
-            proxy_out_errstring(c, "out of memory");
+            proxy_out_errstring(c->resp, "out of memory");
             return;
         }
         c->item_malloced = true;
@@ -905,38 +878,7 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen) {
         return;
     }
 
-    // call the function via coroutine.
-    int cores = lua_resume(Lc, NULL, 1, &nresults);
-    mc_resp *resp = c->resp;
-    size_t rlen = 0;
-
-    if (cores == LUA_OK) {
-        // figure out if we have a response object, raw string, or what.
-        int type = lua_type(Lc, -1);
-
-        if ((type == LUA_TUSERDATA && lua_getiuservalue(Lc, -1, 1) != LUA_TNONE) || type == LUA_TSTRING) {
-            // FIXME: checkudata, testudata? anything to directly check this?
-            const char *s = lua_tolstring(Lc, -1, &rlen);
-            size_t l = rlen > WRITE_BUFFER_SIZE ? WRITE_BUFFER_SIZE : rlen;
-            memcpy(resp->wbuf, s, l);
-            resp_add_iov(resp, resp->wbuf, l);
-            lua_pop(Lc, 1);
-        } else {
-            memcpy(resp->wbuf, "ERROR\r\n", 7);
-            resp_add_iov(resp, resp->wbuf, 7);
-        }
-    } else if (cores == LUA_YIELD) {
-        // NOTE: this is returning "self" somehow. not sure if it matters.
-        //dump_stack(Lc);
-        // This holds a reference to Lc so it can be resumed on this thread
-        // later. Lc itself holds references to server/request data.
-        int coro_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-        mcp_queue_io(c, coro_ref, Lc);
-    } else {
-        // TODO: Should we be shipping a generic error to client and a
-        // specific error to logger?
-        proxy_out_errstring(c, lua_tostring(Lc, -1));
-    }
+    proxy_run_coroutine(Lc, c->resp, NULL, c);
 
     lua_settop(L, 0); // clear anything remaining on the main thread.
 }
