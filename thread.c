@@ -553,7 +553,7 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
                     }
 #endif
 #ifdef PROXY
-                    conn_io_queue_add(c, IO_QUEUE_PROXY, NULL, proxy_submit_cb,
+                    conn_io_queue_add(c, IO_QUEUE_PROXY, settings.proxy_threads, proxy_submit_cb,
                             proxy_complete_cb, proxy_finalize_cb);
 #endif
                     conn_io_queue_add(c, IO_QUEUE_NONE, NULL, NULL, NULL, NULL);

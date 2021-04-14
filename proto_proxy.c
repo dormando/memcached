@@ -14,6 +14,7 @@
 #include "proto_proxy.h"
 #include "proto_text.h"
 #include "murmur3_hash.h"
+#include "queue.h"
 
 // FIXME: do include dir properly.
 #include "vendor/mcmc/mcmc.h"
@@ -24,6 +25,9 @@
 #define MCP_THREAD_UPVALUE 1
 #define MCP_ATTACH_UPVALUE 2
 
+// TODO: move to config option.
+#define BACKEND_IO_THREADS 4
+
 typedef uint32_t (*hash_selector_func)(const void *key, size_t len);
 typedef struct {
     hash_selector_func func;
@@ -32,6 +36,7 @@ typedef struct {
 static mcp_hashfunc_t mcplib_hashfunc_murmur3 = { MurmurHash3_x86_32 };
 
 typedef struct _io_pending_proxy_t io_pending_proxy_t;
+typedef struct proxy_event_thread_s proxy_event_thread;
 
 enum mcp_server_states {
     mcp_server_read = 0, // waiting to read any response
@@ -40,6 +45,7 @@ enum mcp_server_states {
     mcp_server_next, // advance to the next IO
 };
 
+typedef struct mcp_server_s mcp_server_t;
 // TODO: tokens, request/etc, aren't safe when used by lua. we need to copy
 // the string in after an allocation and __gc it later (or remove it early?)
 // for the C API these could just point into c->rbuf and be a fast path.
@@ -51,6 +57,7 @@ enum mcp_server_states {
 // FIXME: until __gc is added rq->buf will leak.
 #define MAX_REQ_TOKENS 2
 typedef struct {
+    mcp_server_t *srv; // server handling this request.
     char *request; // original whole string command.
     size_t reqlen; // length of command. no null-byte.
     token_t tokens[MAX_REQ_TOKENS]; // command and key
@@ -65,21 +72,49 @@ typedef struct {
 } mcp_request_t;
 
 // TODO: array of clients based on connection limit.
+typedef STAILQ_HEAD(io_head_s, _io_pending_proxy_t) io_head_t;
 #define MAX_IPLEN 45
 #define MAX_PORTLEN 6
-typedef struct {
+struct mcp_server_s {
     char ip[MAX_IPLEN+1];
     char port[MAX_PORTLEN+1];
     double weight;
+    pthread_mutex_t mutex; // covers stack.
+    proxy_event_thread *event_thread; // event thread owning this server.
     void *client; // mcmc client
-    io_pending_proxy_t *req_stack_head;
-    io_pending_proxy_t *req_stack_tail;
+    STAILQ_ENTRY(mcp_server_s) be_next; // stack for backends
+    io_head_t io_head; // stack of requests.
     char *rbuf; // TODO: from thread's rbuf cache.
     struct event event; // libevent
     enum mcp_server_states state; // readback state machine
     bool connecting; // in the process of an asynch connection.
     bool can_write; // recently got a WANT_WRITE or are connecting.
-} mcp_server_t;
+    bool stacked; // if server already queued for syscalls.
+};
+typedef STAILQ_HEAD(be_head_s, mcp_server_s) be_head_t;
+
+typedef struct proxy_backend_thread_s proxy_backend_thread;
+struct proxy_event_thread_s {
+    pthread_t thread_id;
+    struct event_base *base;
+    struct event notify_event; // listen event for the notify pipe.
+    pthread_mutex_t mutex; // covers stack.
+    pthread_cond_t cond; // condition to wait on while stack drains.
+    io_head_t io_head_in; // inbound requests to process.
+    be_head_t be_head; // stack of backends for processing.
+    mcp_server_t *iter; // used as an iterator through the be list
+    proxy_backend_thread *bt; // array of backend threads.
+    int notify_receive_fd;
+    int notify_send_fd;
+};
+
+// threads owned by an event thread for submitting syscalls.
+struct proxy_backend_thread_s {
+    pthread_t thread_id;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    proxy_event_thread *ev;
+};
 
 typedef struct {
     mcmc_resp_t resp;
@@ -97,8 +132,8 @@ struct _io_pending_proxy_t {
     conn *c;
     mc_resp *resp;  // original struct ends here
 
-    struct _io_pending_proxy_t *next; // request chain for batch submission.
-    struct _io_pending_proxy_t *server_next; // sub-chain when queued on a server.
+    struct _io_pending_proxy_t *next; // stack for IO submission
+    STAILQ_ENTRY(_io_pending_proxy_t) io_next; // stack for backends
     int coro_ref; // lua registry reference to the coroutine
     lua_State *coro; // pointer directly to the coroutine
     mcp_server_t *server; // backend server to request from
@@ -107,6 +142,21 @@ struct _io_pending_proxy_t {
     mcp_resp_t *client_resp; // reference (currently pointing to a lua object)
     bool flushed; // whether we've fully written this request to a backend.
 };
+
+// TODO: hash func should take an initializer
+// so we can hash a few things together.
+// also, 64bit? 32bit? either?
+// TODO: hash selectors should hash to a list of "Things"
+// things can be anything callable: lua funcs, hash selectors, servers.
+typedef struct {
+    int ref; // luaL_ref reference.
+    mcp_server_t *srv;
+} mcp_hash_selector_srv_t;
+typedef struct {
+    hash_selector_func func;
+    int pool_size;
+    mcp_hash_selector_srv_t pool[];
+} mcp_hash_selector_t;
 
 static int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t *p, conn *c);
 static void proxy_process_command(conn *c, char *command, size_t cmdlen);
@@ -120,41 +170,399 @@ static void _set_event(mcp_server_t *s, struct event_base *base, int flags, stru
 
 // -------------- EXTERNAL FUNCTIONS
 
-// Initialize the VM for an individual worker thread.
-// TODO: global config thread system.
-void proxy_thread_init(LIBEVENT_THREAD *thr) {
-    lua_State *L = luaL_newstate();
-    thr->L = L;
-    luaL_openlibs(L);
-    proxy_register_libs(thr, L);
+struct _dumpbuf {
+    size_t size;
+    size_t used;
+    char *buf;
+};
 
-    // load/compile the function into our instance.
-    // TODO: need real error function.
-    if (luaL_dofile(L, settings.proxy_startfile)) {
-        fprintf(stderr, "Failed to run lua initializer for worker: %s\n", lua_tostring(L, -1));
+static int _dump_helper(lua_State *L, const void *p, size_t sz, void *ud) {
+    (void)L;
+    struct _dumpbuf *db = ud;
+    if (db->used + sz > db->size) {
+        db->size *= 2;
+        char *nb = realloc(db->buf, db->size);
+        if (nb == NULL) {
+            return -1;
+        }
+        db->buf = nb;
+    }
+    memcpy(db->buf + db->used, (const char *)p, sz);
+    db->used += sz;
+    return 0;
+}
+
+static const char * _load_helper(lua_State *L, void *data, size_t *size) {
+    (void)L;
+    struct _dumpbuf *db = data;
+    if (db->used == 0) {
+        *size = 0;
+        return NULL;
+    }
+    *size = db->used;
+    db->used = 0;
+    return db->buf;
+}
+
+// handler for adding requests to a server's queue.
+// FIXME: is this going to get mass fired even though we're batching here?
+// FIXME: rename to proxy_evthread_handler ?
+static void proxy_backend_handler(evutil_socket_t fd, short which, void *arg) {
+    proxy_event_thread *t = arg;
+    io_head_t head;
+
+    char buf[1];
+    // TODO: This is a lot more fatal than it should be. can it fail? can
+    // it blow up the server?
+    if (read(fd, buf, 1) != 1) {
+        return;
+    }
+
+    STAILQ_INIT(&head);
+    STAILQ_INIT(&t->be_head);
+
+    // Pull the entire stack of inbound into local queue.
+    pthread_mutex_lock(&t->mutex);
+    STAILQ_CONCAT(&head, &t->io_head_in);
+    pthread_mutex_unlock(&t->mutex);
+
+    int io_count = 0;
+    int be_count = 0;
+    while(!STAILQ_EMPTY(&head)) {
+        io_pending_proxy_t *io = STAILQ_FIRST(&head);
+        io->flushed = false;
+        mcp_server_t *s = io->server;
+        // So the server can retrieve its event base.
+        s->event_thread = t;
+
+        // _no_ mutex on backends. they are owned by the event thread.
+        STAILQ_REMOVE_HEAD(&head, io_next);
+        STAILQ_INSERT_TAIL(&s->io_head, io, io_next);
+        // be->depth++ ?
+        io_count++;
+        if (!s->stacked) {
+            s->stacked = true;
+            STAILQ_INSERT_TAIL(&t->be_head, s, be_next);
+            be_count++;
+        }
+    }
+
+    // initialize iterator.
+    t->iter = STAILQ_FIRST(&t->be_head);
+
+    // TODO: if IO count is low, run in-line.
+    // IO requests are now stacked into per-backend queues.
+    // we do this here to avoid needing mutexes on backends.
+    for (int x = 0; x < BACKEND_IO_THREADS; x++) {
+        proxy_backend_thread *bt = &t->bt[x];
+        pthread_cond_signal(&bt->cond);
+        if (x == be_count)
+            break;
+    }
+
+    // TODO: could speculatively run the event_add's all here while the
+    // threads run.
+
+    pthread_mutex_lock(&t->mutex);
+    // wait for bg threads while iterator is still valid.
+    if (t->iter != NULL) {
+        pthread_cond_wait(&t->cond, &t->mutex);
+    }
+    pthread_mutex_unlock(&t->mutex);
+
+    // Re-walk each backend and check set event as required.
+    mcp_server_t *s = NULL;
+    struct timeval tmp_time = {5,0}; // FIXME: temporary hard coded timeout.
+
+    // FIXME: _set_event() is buggy, see notes on function.
+    STAILQ_FOREACH(s, &t->be_head, be_next) {
+        s->stacked = false;
+        int flags = s->can_write ? EV_READ|EV_TIMEOUT : EV_READ|EV_WRITE|EV_TIMEOUT;
+        _set_event(s, t->base, flags, tmp_time);
+    }
+
+}
+
+// TODO: rename to evthread_syscall_worker ?
+static void *backend_thread_worker(void *arg) {
+    proxy_backend_thread *t = arg;
+    pthread_mutex_lock(&t->mutex);
+    while (1) {
+        proxy_event_thread *ev = t->ev;
+        pthread_mutex_lock(&ev->mutex);
+        if (ev->iter == NULL) {
+            pthread_cond_signal(&ev->cond);
+            pthread_mutex_unlock(&ev->mutex);
+            pthread_cond_wait(&t->cond, &t->mutex);
+            continue;
+        }
+
+        // Get a backend to process.
+        mcp_server_t *s = ev->iter;
+        // bump the iterator for the next thread.
+        ev->iter = STAILQ_NEXT(s, be_next);
+        pthread_mutex_unlock(&ev->mutex);
+
+        // If we're in a connecting state, simply skip the flush here and let
+        // the event thread wait for a write event.
+        if (s->connecting) {
+            continue;
+        }
+        // FIXME: move to a function so we can call this from
+        // proxy_server_handler.
+        io_pending_proxy_t *io = NULL;
+        int flags = 0;
+        STAILQ_FOREACH(io, &s->io_head, io_next) {
+            flags |= _flush_pending_write(s, io);
+            if (flags & EV_WRITE) {
+                break;
+            }
+        }
+
+    }
+
+    return NULL;
+}
+
+static void *proxy_event_worker(void *arg) {
+    proxy_event_thread *t = arg;
+
+    // create our dedicated backend threads for syscall fanout.
+    t->bt = calloc(BACKEND_IO_THREADS, sizeof(proxy_backend_thread));
+    assert(t->bt != NULL); // TODO: unlikely malloc error.
+    for (int x = 0;x < BACKEND_IO_THREADS; x++) {
+        proxy_backend_thread *bt = &t->bt[x];
+        bt->ev = t;
+        pthread_mutex_init(&bt->mutex, NULL);
+        pthread_cond_init(&bt->cond, NULL);
+
+        // TODO: second null is func.
+        pthread_create(&bt->thread_id, NULL, backend_thread_worker, bt);
+    }
+
+    event_base_loop(t->base, 0);
+    event_base_free(t->base);
+
+    // TODO: join bt threads, free array.
+
+    return NULL;
+}
+
+// start the centralized lua state and config thread.
+void proxy_init(void) {
+    lua_State *L = luaL_newstate();
+    settings.proxy_state = L;
+    luaL_openlibs(L);
+    // NOTE: might need to differentiate the libs yes?
+    proxy_register_libs(NULL, L);
+
+    int res = luaL_loadfile(L, settings.proxy_startfile);
+    if (res != LUA_OK) {
+        fprintf(stderr, "Failed to load proxy_startfile: %s\n", lua_tostring(L, -1));
+        exit(EXIT_FAILURE);
+    }
+    // LUA_OK, LUA_ERRSYNTAX, LUA_ERRMEM, LUA_ERRFILE
+
+    // Now we need to dump the compiled code into bytecode.
+    // This will then get loaded into worker threads.
+    struct _dumpbuf *db = malloc(sizeof(struct _dumpbuf));
+    db->size = 16384;
+    db->used = 0;
+    db->buf = malloc(db->size);
+    lua_dump(L, _dump_helper, db, 0);
+    // 0 means no error.
+    settings.proxy_code = db;
+
+    // Create/start the backend threads, which we need before servers
+    // start getting created.
+    // TODO: Supporting N event threads should be possible, but it will be a
+    // low number of N to avoid too many wakeup syscalls.
+    // For now we hardcode to 1.
+    proxy_event_thread *threads = calloc(1, sizeof(proxy_event_thread));
+    settings.proxy_threads = threads;
+    for (int i = 0; i < 1; i++) {
+        proxy_event_thread *t = &threads[i];
+        // TODO: "if linux, use eventfd instead"
+        int fds[2];
+        if (pipe(fds)) {
+            perror("can't create proxy backend notify pipe");
+            exit(1);
+        }
+
+        t->notify_receive_fd = fds[0];
+        t->notify_send_fd = fds[1];
+
+        struct event_config *ev_config;
+        ev_config = event_config_new();
+        event_config_set_flag(ev_config, EVENT_BASE_FLAG_NOLOCK);
+        t->base = event_base_new_with_config(ev_config);
+        event_config_free(ev_config);
+        if (! t->base) {
+            fprintf(stderr, "Can't allocate event base\n");
+            exit(1);
+        }
+
+        // listen for notifications.
+        // NULL was thread_libevent_process
+        // FIXME: use modern format? (event_assign)
+        event_set(&t->notify_event, t->notify_receive_fd,
+              EV_READ | EV_PERSIST, proxy_backend_handler, t);
+        event_base_set(t->base, &t->notify_event);
+        if (event_add(&t->notify_event, 0) == -1) {
+            fprintf(stderr, "Can't monitor libevent notify pipe\n");
+            exit(1);
+        }
+
+        // incoming request queue.
+        STAILQ_INIT(&t->io_head_in);
+        pthread_mutex_init(&t->mutex, NULL);
+        pthread_cond_init(&t->cond, NULL);
+
+        pthread_create(&t->thread_id, NULL, proxy_event_worker, t);
+    }
+
+    // now we complete the data load by calling the function.
+    res = lua_pcall(L, 0, LUA_MULTRET, 0);
+    if (res != LUA_OK) {
+        fprintf(stderr, "Failed to load data into L\n");
         exit(EXIT_FAILURE);
     }
 
-    // config should define functions:
-    // - mcp_config_selectors
-    //   - returns table containing new selectors
-    //   - or nil to not overwrite.
-    // - mcp_config_routes(ss)
-    //   - uses mcp.attach() to define new functions to call
-    // TODO: we fetch and call these here now,
-    // but they will move. :P
+    // call the mcp_config_selectors function to get the central servers.
     lua_getglobal(L, "mcp_config_selectors");
 
-    // TODO: check if it worked?
+    // TODO: handle explicitly if function is missing.
     lua_pushnil(L); // no "old" config yet.
     if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
         fprintf(stderr, "Failed to execute mcp_config_selectors: %s\n", lua_tostring(L, -1));
         exit(EXIT_FAILURE);
     }
 
-    // selector lib is top on stack.
+    // result is our main config.
+}
+
+// TODO: this will be done differently while implementing config reloading.
+static int _copy_hash_selector(lua_State *from, lua_State *to) {
+    // from, -3 should have he userdata.
+    mcp_hash_selector_t *ss = luaL_checkudata(from, -3, "mcp.hash_selector");
+    size_t size = sizeof(mcp_hash_selector_t) + sizeof(mcp_hash_selector_srv_t) * ss->pool_size;
+    mcp_hash_selector_t *css = lua_newuserdatauv(to, size, 0);
+    luaL_setmetatable(to, "mcp.hash_selector");
+    // TODO: check css.
+
+    // TODO: we just straight copy the references here, pointing at the
+    // mcp.server's from the config without actually holding proper
+    // references!
+    // This is done today because there's no code reload.
+    // To implement code reload this will need to add references to the
+    // original structure to hold it.
+    memcpy(css, ss, size);
+    return 0;
+}
+
+static void _copy_config_table(lua_State *from, lua_State *to);
+// (from, -1) is the source value
+// should end with (to, -1) being the new value.
+// TODO: { foo = "bar", { thing = "foo" } } fails for lua_next() post final
+// table.
+static void _copy_config_table(lua_State *from, lua_State *to) {
+    int type = lua_type(from, -1);
+    bool found = false;
+    switch (type) {
+        case LUA_TNIL:
+            lua_pushnil(to);
+            break;
+        case LUA_TUSERDATA:
+            // see dump_stack() - check if it's something we handle.
+            if (lua_getmetatable(from, -1) != 0) {
+                lua_pushstring(from, "__name");
+                if (lua_rawget(from, -2) != LUA_TNIL) {
+                    const char *name = lua_tostring(from, -1);
+                    if (strcmp(name, "mcp.hash_selector") == 0) {
+                        // FIXME: check result
+                        _copy_hash_selector(from, to);
+                        found = true;
+                    }
+                }
+                lua_pop(from, 2);
+            }
+            if (!found) {
+                fprintf(stderr, "unhandled userdata type\n");
+                exit(1);
+            }
+            break;
+        case LUA_TNUMBER:
+            // FIXME: since 5.3 there's some sub-thing you need to do to push
+            // float vs int.
+            lua_pushnumber(to, lua_tonumber(from, -1));
+            break;
+        case LUA_TSTRING:
+            // FIXME: temp var + tolstring worth doing?
+            lua_pushlstring(to, lua_tostring(from, -1), lua_rawlen(from, -1));
+            break;
+        case LUA_TTABLE:
+            // TODO: huge table could cause stack exhaustion? have to do
+            // checkstack perhaps?
+            // TODO: copy the metatable first?
+            // TODO: size narr/nrec from old table and use createtable to
+            // pre-allocate.
+            lua_newtable(to); // throw new table on worker
+            int t = lua_absindex(from, -1); // static index of table to copy.
+            int nt = lua_absindex(to, -1); // static index of new table.
+            lua_pushnil(from); // start iterator for main
+            while (lua_next(from, t) != 0) {
+                // (key, -2), (val, -1)
+                // TODO: check what key is (it can be anything :|)
+                // to allow an optimization later lets restrict it to strings
+                // and numbers.
+                // don't coerce it to a string unless it already is one.
+                lua_pushlstring(to, lua_tostring(from, -2), lua_rawlen(from, -2));
+                // lua_settable(to, n) - n being the table
+                // takes -2 key -1 value, pops both.
+                // use lua_absindex(L, -1) and so to convert easier?
+                _copy_config_table(from, to); // push next value.
+                lua_settable(to, nt);
+                lua_pop(from, 1); // drop value, keep key.
+            }
+            // top of from is now the original table.
+            // top of to should be the new table.
+            break;
+        default:
+            // FIXME: error.
+            fprintf(stderr, "unhandled type\n");
+            exit(1);
+    }
+}
+
+// Initialize the VM for an individual worker thread.
+// TODO: is there any performance advantage to doing this with a single pcall?
+// if possible?
+void proxy_thread_init(LIBEVENT_THREAD *thr) {
+    lua_State *L = luaL_newstate();
+    thr->L = L;
+    luaL_openlibs(L);
+    proxy_register_libs(thr, L);
+
+    // load the precompiled config function.
+    struct _dumpbuf *db = settings.proxy_code;
+    struct _dumpbuf db2; // copy because the helper modifies it.
+    memcpy(&db2, db, sizeof(struct _dumpbuf));
+
+    lua_load(L, _load_helper, &db2, "config", NULL);
+    // LUA_OK + all errs from loadfile except LUA_ERRFILE.
+    //dump_stack(L);
+    // - pcall the func (which should load it)
+    int res = lua_pcall(L, 0, LUA_MULTRET, 0);
+    if (res != LUA_OK) {
+        fprintf(stderr, "Failed to load data into L2\n");
+        exit(EXIT_FAILURE);
+    }
+
     lua_getglobal(L, "mcp_config_routes");
-    lua_rotate(L, -2, -1); // move the return value from config_selectors in front of the function.
+    // create deepcopy of argument to pass into mcp_config_routes.
+    _copy_config_table((lua_State *)settings.proxy_state, L);
+
+    // copied value is in front of route function, now call it.
     if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
         fprintf(stderr, "Failed to execute mcp_config_routes: %s\n", lua_tostring(L, -1));
         exit(EXIT_FAILURE);
@@ -162,49 +570,41 @@ void proxy_thread_init(LIBEVENT_THREAD *thr) {
 }
 
 // ctx_stack is a stack of io_pending_proxy_t's.
-// TODO: once we have background thread[s] for handling backend servers
-// this will need to do a lot more work.
-// For right now, each worker thread owns independent server objects.
-// Flow:
-// - run requests directly
-// - use p->c's event base to give the server an event handler callback
-// - re-stack IO's, in order the responses will be checked, onto the server
-// - that's it for here.
-// TODO: after moving to the dedicated thread, we can look for batching
-// opportunities. need an mcmc iovec interface first though.
 void proxy_submit_cb(void *ctx, void *ctx_stack) {
+    proxy_event_thread *e = ctx;
     io_pending_proxy_t *p = ctx_stack;
-    struct timeval tmp_time = {5,0}; // FIXME: temporary hard coded response timeout.
+    io_head_t head;
+    STAILQ_INIT(&head);
 
+    // TODO: loop objects into secondary list. submit that list, which gets
+    // cleared.
+    // NOTE: responses get returned in the correct order no matter what, since
+    // mc_resp's are linked.
+    // we just need to ensure stuff is parsed off the backend in the correct
+    // order.
+    // So we can do with a single list here, but we need to repair the list as
+    // responses are parsed. (in the req_remaining-- section)
+    // NOTE NOTE:
+    // - except we can't do that because the deferred IO stack isn't
+    // compatible with queue.h.
+    // So for now we build the secondary list with an STAILQ, which
+    // can be transplanted/etc.
     while (p) {
-        mcp_server_t *s = p->server;
-
-        // If we're not in the process of connecting, we can immediately issue
-        // the request.
-        if (s->can_write) {
-            // TODO: check for connected, reconnect if necessary.
-            // s->can_write should deal with this?
-            _flush_pending_write(s, p);
-        }
-        int flags = s->can_write ? EV_READ|EV_TIMEOUT : EV_READ|EV_WRITE|EV_TIMEOUT;
-        _set_event(s, p->c->thread->base, flags, tmp_time);
-
-        // stack IO using secondary next ptr. need to guarantee FIFO.
-        // this may not always be safe; IO's are "stuck" until processed out
-        // from a server object. will that always be true? if not, we need to
-        // allocate an array on the server object to hold pending items.
-        if (s->req_stack_head == NULL) {
-            s->req_stack_head = p;
-        }
-        if (s->req_stack_tail == NULL) {
-            s->req_stack_tail = p;
-        } else {
-            s->req_stack_tail->server_next = p;
-            s->req_stack_tail = p;
-            p->server_next = NULL;
-        }
-
+        // insert into tail so head is oldest request.
+        STAILQ_INSERT_TAIL(&head, p, io_next);
         p = p->next;
+    }
+
+    // Transfer request stack to event thread.
+    pthread_mutex_lock(&e->mutex);
+    STAILQ_CONCAT(&e->io_head_in, &head);
+    // No point in holding the lock since we're not doing a cond signal.
+    pthread_mutex_unlock(&e->mutex);
+
+    // Signal to check queue.
+    // TODO: eventfd, error handling.
+    if (write(e->notify_send_fd, "w", 1) <= 0) {
+        assert(1 == 0);
     }
 
     return;
@@ -403,6 +803,8 @@ static void proxy_lua_ferror(lua_State *L, const char *fmt, ...) {
     lua_error(L);
 }
 
+// FIXME: if we use the newer API the various pending checks can be adjusted.
+// FIXME: If we already had EV_READ but need to add EV_WRITE, this fails.
 static void _set_event(mcp_server_t *s, struct event_base *base, int flags, struct timeval t) {
     // FIXME: chicken and egg.
     // can't check if pending if the structure is was calloc'ed (sigh)
@@ -521,7 +923,7 @@ static int proxy_server_drive_machine(mcp_server_t *s) {
 
     switch(s->state) {
         case mcp_server_read:
-            p = s->req_stack_head;
+            p = STAILQ_FIRST(&s->io_head);
             assert(p != NULL);
             // FIXME: get the buffer from thread?
             if (s->rbuf == NULL) {
@@ -573,13 +975,10 @@ static int proxy_server_drive_machine(mcp_server_t *s) {
                 // for now lets abuse write_and_free on mc_resp and simply malloc the
                 // space we need, stuffing it into the resp object.
                 // how will lua be able to generate a fake response tho?
-                // TODO: if item is large enough (or not fully read), allocate
-                // an item and copy into it or try an immediate read.
-                // need to stop and re-schedule the event if not enough data.
 
                 r->blen = r->resp.reslen + r->resp.vlen;
                 r->buf = malloc(r->blen + extra_space);
-                // TODO: check buf. but also avoid the malloc via slab alloc.
+                // TODO: check buf
 
                 if (r->resp.vlen == r->resp.vlen_read) {
                     // TODO: some mcmc func for pulling the whole buffer?
@@ -615,7 +1014,7 @@ static int proxy_server_drive_machine(mcp_server_t *s) {
 
             break;
         case mcp_server_read_end:
-            p = s->req_stack_head;
+            p = STAILQ_FIRST(&s->io_head);
             r = p->client_resp;
             // we need to advance the buffer and ensure the next data
             // in the stream is "END\r\n"
@@ -651,7 +1050,7 @@ static int proxy_server_drive_machine(mcp_server_t *s) {
             break;
         case mcp_server_want_read:
             // Continuing a read from earlier
-            p = s->req_stack_head;
+            p = STAILQ_FIRST(&s->io_head);
             r = p->client_resp;
             status = mcmc_read_value(s->client, r->buf+r->resp.reslen, r->resp.vlen, &r->bread);
             if (status == MCMC_OK) {
@@ -672,17 +1071,17 @@ static int proxy_server_drive_machine(mcp_server_t *s) {
             break;
         case mcp_server_next:
             // set the head here. when we break the head will be correct.
-            s->req_stack_head = p->server_next;
-            if (s->req_stack_tail == p) {
+            STAILQ_REMOVE_HEAD(&s->io_head, io_next);
+            if (STAILQ_EMPTY(&s->io_head)) {
                 // TODO: suspicious of this code. audit harder?
-                s->req_stack_tail = NULL;
                 stop = true;
-                assert(s->req_stack_head == NULL);
             }
 
             // have to do the q->count-- and == 0 and redispatch_conn()
             // stuff here. The moment we call that write we
             // don't own *p anymore.
+            // FIXME: are there any other spots where p->q or p's p->next
+            // stack are examined from what would be multiple servers at once?
             p->q->count--;
             if (p->q->count == 0) {
                 redispatch_conn(p->c);
@@ -767,27 +1166,24 @@ static int _flush_pending_write(mcp_server_t *s, io_pending_proxy_t *p) {
 }
 
 // The libevent callback handler.
+// TODO: replace function?
 static void proxy_server_handler(const int fd, const short which, void *arg) {
     mcp_server_t *s = arg;
     int flags = EV_TIMEOUT;
-    // TODO: since this is worker-inline only, we're pulling the event base
-    // from the requests. when bg pool owns servers this will change.
     struct timeval tmp_time = {5,0}; // FIXME: temporary hard coded response timeout.
-
-    if (which & EV_READ) {
-        flags |= proxy_server_drive_machine(s);
-        // TODO: need to re-add the read event if the stack isn't NULL
-    }
 
     // allow dequeuing anything ready to be read before we process EV_TIMEOUT;
     // though it might not be possible for both to fire.
     if (which & EV_TIMEOUT) {
         // TODO: walk stack and set timeout status on each object.
         // then return.
+        fprintf(stderr, "timeout unhandled\n");
+        //assert(1 == 0);
     }
 
     if (which & EV_WRITE) {
         s->can_write = true;
+        // TODO: move connect routine to its own function?
         if (s->connecting) {
             int err = 0;
             // We were connecting, now ensure we're properly connected.
@@ -796,28 +1192,29 @@ static void proxy_server_handler(const int fd, const short which, void *arg) {
                 // first.
                 // TODO: will need a mechanism for max retries, waits between
                 // fast-fails, and failing the stack equivalent to a timeout.
+                assert(1 == 0);
             }
+            s->connecting = false;
+        }
+        // TODO: another wrapper function? This loop is duplicated.
+        io_pending_proxy_t *io = NULL;
+        STAILQ_FOREACH(io, &s->io_head, io_next) {
+            flags |= _flush_pending_write(s, io);
+            if (flags & EV_WRITE) {
+                break;
+            }
+        }
+    }
 
-        }
-        io_pending_proxy_t *p = s->req_stack_head;
-        while (p) {
-            io_pending_proxy_t *next_p = p->server_next;
-            flags |= _flush_pending_write(s, p);
-            p = next_p;
-        }
+    if (which & EV_READ) {
+        flags |= proxy_server_drive_machine(s);
     }
 
     // Still pending requests to read or write.
-    // TODO: as noted above, we're pulling the event base from a random
-    // connection and reusing it, as this work is currently done inline with
-    // the worker always.
-    // the base should be copied to the server object which should be future
-    // proof.
     // TODO: need to handle errors from above so we don't go to sleep here.
-    if (s->req_stack_head != NULL) {
-        _set_event(s, s->req_stack_head->c->thread->base, flags, tmp_time);
+    if (!STAILQ_EMPTY(&s->io_head)) {
+        _set_event(s, s->event_thread->base, flags, tmp_time);
     }
-
 }
 
 static void proxy_process_command(conn *c, char *command, size_t cmdlen) {
@@ -883,11 +1280,10 @@ static void mcp_queue_io(conn *c, int coro_ref, lua_State *Lc) {
     io_queue_t *q = conn_io_queue_get(c, IO_QUEUE_PROXY);
     mc_resp *resp = c->resp;
 
-    // Top of the Lc stack should be server. Will hold onto this for now.
-    mcp_server_t *s = luaL_checkudata(Lc, -1, "mcp.server");
+    // stack: request, hash selector. latter just to hold a reference.
 
-    // Then the request object.
-    mcp_request_t *rq = luaL_checkudata(Lc, -2, "mcp.request");
+    mcp_request_t *rq = luaL_checkudata(Lc, -1, "mcp.request");
+    mcp_server_t *s = rq->srv;
     // FIXME: need to check for "if request modified" and recreate it.
     // Use a local function rather than calling __tostring through lua.
 
@@ -952,22 +1348,22 @@ static void mcp_queue_io(conn *c, int coro_ref, lua_State *Lc) {
 __attribute__((unused)) static void dump_stack(lua_State *L) {
     int top = lua_gettop(L);
     int i = 1;
-    printf("--TOP OF STACK [%d]\n", top);
+    fprintf(stderr, "--TOP OF STACK [%d]\n", top);
     for (; i < top + 1; i++) {
         int type = lua_type(L, i);
         // lets find the metatable of this userdata to identify it.
         if (lua_getmetatable(L, i) != 0) {
             lua_pushstring(L, "__name");
             if (lua_rawget(L, -2) != LUA_TNIL) {
-                printf("--|%d| [%s] (%s)\n", i, lua_typename(L, type), lua_tostring(L, -1));
+                fprintf(stderr, "--|%d| [%s] (%s)\n", i, lua_typename(L, type), lua_tostring(L, -1));
                 lua_pop(L, 2);
                 continue;
             }
             lua_pop(L, 2);
         }
-        printf("--|%d| [%s]\n", i, lua_typename(L, type));
+        fprintf(stderr, "--|%d| [%s]\n", i, lua_typename(L, type));
     }
-    printf("-----------------\n");
+    fprintf(stderr, "-----------------\n");
 }
 
 // func prototype example:
@@ -1016,11 +1412,11 @@ static int mcplib_server(lua_State *L) {
     strncpy(s->port, port, MAX_PORTLEN);
     s->weight = weight;
     s->rbuf = NULL;
-    s->req_stack_head = NULL;
-    s->req_stack_tail = NULL;
+    STAILQ_INIT(&s->io_head);
     s->state = mcp_server_read;
     s->connecting = false;
     s->can_write = false;
+    s->stacked = false;
 
     // initialize libevent.
     memset(&s->event, 0, sizeof(s->event));
@@ -1053,21 +1449,6 @@ static int mcplib_server(lua_State *L) {
     return 1;
 }
 
-// TODO: hash func should take an initializer
-// so we can hash a few things together.
-// also, 64bit? 32bit? either?
-// TODO: hash selectors should hash to a list of "Things"
-// things can be anything callable: lua funcs, hash selectors, servers.
-typedef struct {
-    int ref; // luaL_ref reference.
-    mcp_server_t *srv;
-} mcp_hash_selector_srv_t;
-typedef struct {
-    hash_selector_func func;
-    int pool_size;
-    mcp_hash_selector_srv_t pool[];
-} mcp_hash_selector_t;
-
 // ss = mcp.hash_selector(hashfunc, pool)
 static int mcplib_hash_selector(lua_State *L) {
     // TODO: need some hash funcs.
@@ -1092,6 +1473,7 @@ static int mcplib_hash_selector(lua_State *L) {
         lua_geti(L, -2, x); // get next server into the stack.
         // TODO: do we leak memory if we bail here?
         // the stack should clear, then release the userdata + etc?
+        // - yes it should leak memory for the registry indexed items.
         s->srv = luaL_checkudata(L, -1, "mcp.server");
         s->ref = luaL_ref(L, LUA_REGISTRYINDEX); // references and pops object.
     }
@@ -1117,15 +1499,12 @@ static int mcplib_hash_selector_call(lua_State *L) {
     char *key = rq->tokens[KEY_TOKEN].value;
     size_t len = rq->tokens[KEY_TOKEN].length;
     uint32_t hash = ss->func(key, len);
-    int ref = ss->pool[hash % ss->pool_size].ref;
 
-    // put the selected server onto the stack.
-    // TODO: watch if sticking the pointer reference on the request or
-    // response objects makes more sense, since it will be a bit faster.
-    // It should be since we immediately yield here.
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+    // attach the server to the request object.
+    // save CPU cycles over rolling it through lua.
+    rq->srv = ss->pool[hash % ss->pool_size].srv;
 
-    // now yield request, server up.
+    // now yield request, hash selector up.
     return lua_yield(L, 2);
 }
 

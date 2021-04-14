@@ -86,7 +86,6 @@ static enum try_read_result try_read_udp(conn *c);
 
 static int start_conn_timeout_thread();
 
-
 /* stats */
 static void stats_init(void);
 static void conn_to_str(const conn *c, char *addr, char *svr_addr);
@@ -5777,6 +5776,11 @@ int main (int argc, char **argv) {
         exit(EX_OSERR);
     }
     /* start up worker threads if MT mode */
+#ifdef PROXY
+    if (settings.proxy_enabled) {
+        proxy_init();
+    }
+#endif
 #ifdef EXTSTORE
     slabs_set_storage(storage);
     memcached_thread_init(settings.num_threads, storage);
