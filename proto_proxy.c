@@ -36,7 +36,7 @@ typedef struct {
 static mcp_hashfunc_t mcplib_hashfunc_murmur3 = { MurmurHash3_x86_32 };
 
 typedef struct _io_pending_proxy_t io_pending_proxy_t;
-typedef struct proxy_event_thread_s proxy_event_thread;
+typedef struct proxy_event_thread_s proxy_event_thread_t;
 
 enum mcp_server_states {
     mcp_server_read = 0, // waiting to read any response
@@ -80,7 +80,7 @@ struct mcp_server_s {
     char port[MAX_PORTLEN+1];
     double weight;
     pthread_mutex_t mutex; // covers stack.
-    proxy_event_thread *event_thread; // event thread owning this server.
+    proxy_event_thread_t *event_thread; // event thread owning this server.
     void *client; // mcmc client
     STAILQ_ENTRY(mcp_server_s) be_next; // stack for backends
     io_head_t io_head; // stack of requests.
@@ -93,7 +93,7 @@ struct mcp_server_s {
 };
 typedef STAILQ_HEAD(be_head_s, mcp_server_s) be_head_t;
 
-typedef struct proxy_backend_thread_s proxy_backend_thread;
+typedef struct proxy_backend_thread_s proxy_backend_thread_t;
 struct proxy_event_thread_s {
     pthread_t thread_id;
     struct event_base *base;
@@ -103,7 +103,7 @@ struct proxy_event_thread_s {
     io_head_t io_head_in; // inbound requests to process.
     be_head_t be_head; // stack of backends for processing.
     mcp_server_t *iter; // used as an iterator through the be list
-    proxy_backend_thread *bt; // array of backend threads.
+    proxy_backend_thread_t *bt; // array of backend threads.
     int notify_receive_fd;
     int notify_send_fd;
 };
@@ -113,7 +113,7 @@ struct proxy_backend_thread_s {
     pthread_t thread_id;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
-    proxy_event_thread *ev;
+    proxy_event_thread_t *ev;
 };
 
 typedef struct {
@@ -208,7 +208,7 @@ static const char * _load_helper(lua_State *L, void *data, size_t *size) {
 // FIXME: is this going to get mass fired even though we're batching here?
 // FIXME: rename to proxy_evthread_handler ?
 static void proxy_backend_handler(evutil_socket_t fd, short which, void *arg) {
-    proxy_event_thread *t = arg;
+    proxy_event_thread_t *t = arg;
     io_head_t head;
 
     char buf[1];
@@ -254,7 +254,7 @@ static void proxy_backend_handler(evutil_socket_t fd, short which, void *arg) {
     // IO requests are now stacked into per-backend queues.
     // we do this here to avoid needing mutexes on backends.
     for (int x = 0; x < BACKEND_IO_THREADS; x++) {
-        proxy_backend_thread *bt = &t->bt[x];
+        proxy_backend_thread_t *bt = &t->bt[x];
         pthread_cond_signal(&bt->cond);
         if (x == be_count)
             break;
@@ -285,10 +285,10 @@ static void proxy_backend_handler(evutil_socket_t fd, short which, void *arg) {
 
 // TODO: rename to evthread_syscall_worker ?
 static void *backend_thread_worker(void *arg) {
-    proxy_backend_thread *t = arg;
+    proxy_backend_thread_t *t = arg;
     pthread_mutex_lock(&t->mutex);
     while (1) {
-        proxy_event_thread *ev = t->ev;
+        proxy_event_thread_t *ev = t->ev;
         pthread_mutex_lock(&ev->mutex);
         if (ev->iter == NULL) {
             pthread_cond_signal(&ev->cond);
@@ -325,13 +325,13 @@ static void *backend_thread_worker(void *arg) {
 }
 
 static void *proxy_event_worker(void *arg) {
-    proxy_event_thread *t = arg;
+    proxy_event_thread_t *t = arg;
 
     // create our dedicated backend threads for syscall fanout.
-    t->bt = calloc(BACKEND_IO_THREADS, sizeof(proxy_backend_thread));
+    t->bt = calloc(BACKEND_IO_THREADS, sizeof(proxy_backend_thread_t));
     assert(t->bt != NULL); // TODO: unlikely malloc error.
     for (int x = 0;x < BACKEND_IO_THREADS; x++) {
-        proxy_backend_thread *bt = &t->bt[x];
+        proxy_backend_thread_t *bt = &t->bt[x];
         bt->ev = t;
         pthread_mutex_init(&bt->mutex, NULL);
         pthread_cond_init(&bt->cond, NULL);
@@ -378,10 +378,10 @@ void proxy_init(void) {
     // TODO: Supporting N event threads should be possible, but it will be a
     // low number of N to avoid too many wakeup syscalls.
     // For now we hardcode to 1.
-    proxy_event_thread *threads = calloc(1, sizeof(proxy_event_thread));
+    proxy_event_thread_t *threads = calloc(1, sizeof(proxy_event_thread_t));
     settings.proxy_threads = threads;
     for (int i = 0; i < 1; i++) {
-        proxy_event_thread *t = &threads[i];
+        proxy_event_thread_t *t = &threads[i];
         // TODO: "if linux, use eventfd instead"
         int fds[2];
         if (pipe(fds)) {
@@ -571,7 +571,7 @@ void proxy_thread_init(LIBEVENT_THREAD *thr) {
 
 // ctx_stack is a stack of io_pending_proxy_t's.
 void proxy_submit_cb(void *ctx, void *ctx_stack) {
-    proxy_event_thread *e = ctx;
+    proxy_event_thread_t *e = ctx;
     io_pending_proxy_t *p = ctx_stack;
     io_head_t head;
     STAILQ_INIT(&head);
