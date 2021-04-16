@@ -38,14 +38,14 @@ static mcp_hashfunc_t mcplib_hashfunc_murmur3 = { MurmurHash3_x86_32 };
 typedef struct _io_pending_proxy_t io_pending_proxy_t;
 typedef struct proxy_event_thread_s proxy_event_thread_t;
 
-enum mcp_server_states {
-    mcp_server_read = 0, // waiting to read any response
-    mcp_server_read_end, // looking for an "END" marker for GET
-    mcp_server_want_read, // read more data to complete command
-    mcp_server_next, // advance to the next IO
+enum mcp_backend_states {
+    mcp_backend_read = 0, // waiting to read any response
+    mcp_backend_read_end, // looking for an "END" marker for GET
+    mcp_backend_want_read, // read more data to complete command
+    mcp_backend_next, // advance to the next IO
 };
 
-typedef struct mcp_server_s mcp_server_t;
+typedef struct mcp_backend_s mcp_backend_t;
 // TODO: tokens, request/etc, aren't safe when used by lua. we need to copy
 // the string in after an allocation and __gc it later (or remove it early?)
 // for the C API these could just point into c->rbuf and be a fast path.
@@ -57,7 +57,7 @@ typedef struct mcp_server_s mcp_server_t;
 // FIXME: until __gc is added rq->buf will leak.
 #define MAX_REQ_TOKENS 2
 typedef struct {
-    mcp_server_t *srv; // server handling this request.
+    mcp_backend_t *be; // backend handling this request.
     char *request; // original whole string command.
     size_t reqlen; // length of command. no null-byte.
     token_t tokens[MAX_REQ_TOKENS]; // command and key
@@ -75,23 +75,23 @@ typedef struct {
 typedef STAILQ_HEAD(io_head_s, _io_pending_proxy_t) io_head_t;
 #define MAX_IPLEN 45
 #define MAX_PORTLEN 6
-struct mcp_server_s {
+struct mcp_backend_s {
     char ip[MAX_IPLEN+1];
     char port[MAX_PORTLEN+1];
     double weight;
     pthread_mutex_t mutex; // covers stack.
-    proxy_event_thread_t *event_thread; // event thread owning this server.
+    proxy_event_thread_t *event_thread; // event thread owning this backend.
     void *client; // mcmc client
-    STAILQ_ENTRY(mcp_server_s) be_next; // stack for backends
+    STAILQ_ENTRY(mcp_backend_s) be_next; // stack for backends
     io_head_t io_head; // stack of requests.
     char *rbuf; // TODO: from thread's rbuf cache.
     struct event event; // libevent
-    enum mcp_server_states state; // readback state machine
+    enum mcp_backend_states state; // readback state machine
     bool connecting; // in the process of an asynch connection.
     bool can_write; // recently got a WANT_WRITE or are connecting.
-    bool stacked; // if server already queued for syscalls.
+    bool stacked; // if backend already queued for syscalls.
 };
-typedef STAILQ_HEAD(be_head_s, mcp_server_s) be_head_t;
+typedef STAILQ_HEAD(be_head_s, mcp_backend_s) be_head_t;
 
 typedef struct proxy_event_io_thread_s proxy_event_io_thread_t;
 struct proxy_event_thread_s {
@@ -102,7 +102,7 @@ struct proxy_event_thread_s {
     pthread_cond_t cond; // condition to wait on while stack drains.
     io_head_t io_head_in; // inbound requests to process.
     be_head_t be_head; // stack of backends for processing.
-    mcp_server_t *iter; // used as an iterator through the be list
+    mcp_backend_t *iter; // used as an iterator through the be list
     proxy_event_io_thread_t *bt; // array of io threads.
     int notify_receive_fd;
     int notify_send_fd;
@@ -136,7 +136,7 @@ struct _io_pending_proxy_t {
     STAILQ_ENTRY(_io_pending_proxy_t) io_next; // stack for backends
     int coro_ref; // lua registry reference to the coroutine
     lua_State *coro; // pointer directly to the coroutine
-    mcp_server_t *server; // backend server to request from
+    mcp_backend_t *backend; // backend server to request from
     struct iovec iov[2]; // request string + tail buffer
     int iovcnt; // 1 or 2...
     mcp_resp_t *client_resp; // reference (currently pointing to a lua object)
@@ -147,15 +147,15 @@ struct _io_pending_proxy_t {
 // so we can hash a few things together.
 // also, 64bit? 32bit? either?
 // TODO: hash selectors should hash to a list of "Things"
-// things can be anything callable: lua funcs, hash selectors, servers.
+// things can be anything callable: lua funcs, hash selectors, backends.
 typedef struct {
     int ref; // luaL_ref reference.
-    mcp_server_t *srv;
-} mcp_hash_selector_srv_t;
+    mcp_backend_t *be;
+} mcp_hash_selector_be_t;
 typedef struct {
     hash_selector_func func;
     int pool_size;
-    mcp_hash_selector_srv_t pool[];
+    mcp_hash_selector_be_t pool[];
 } mcp_hash_selector_t;
 
 static int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t *p, conn *c);
@@ -163,10 +163,10 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen);
 static void dump_stack(lua_State *L);
 static void mcp_queue_io(conn *c, int coro_ref, lua_State *Lc);
 static mcp_request_t *mcp_new_request(lua_State *L, char *command, size_t cmdlen);
-static void proxy_server_handler(const int fd, const short which, void *arg);
+static void proxy_backend_handler(const int fd, const short which, void *arg);
 static void proxy_out_errstring(mc_resp *resp, const char *str);
-static int _flush_pending_write(mcp_server_t *s, io_pending_proxy_t *p);
-static void _set_event(mcp_server_t *s, struct event_base *base, int flags, struct timeval t);
+static int _flush_pending_write(mcp_backend_t *be, io_pending_proxy_t *p);
+static void _set_event(mcp_backend_t *be, struct event_base *base, int flags, struct timeval t);
 
 // -------------- EXTERNAL FUNCTIONS
 
@@ -231,18 +231,18 @@ static void proxy_event_handler(evutil_socket_t fd, short which, void *arg) {
     while(!STAILQ_EMPTY(&head)) {
         io_pending_proxy_t *io = STAILQ_FIRST(&head);
         io->flushed = false;
-        mcp_server_t *s = io->server;
-        // So the server can retrieve its event base.
-        s->event_thread = t;
+        mcp_backend_t *be = io->backend;
+        // So the backend can retrieve its event base.
+        be->event_thread = t;
 
         // _no_ mutex on backends. they are owned by the event thread.
         STAILQ_REMOVE_HEAD(&head, io_next);
-        STAILQ_INSERT_TAIL(&s->io_head, io, io_next);
+        STAILQ_INSERT_TAIL(&be->io_head, io, io_next);
         // be->depth++ ?
         io_count++;
-        if (!s->stacked) {
-            s->stacked = true;
-            STAILQ_INSERT_TAIL(&t->be_head, s, be_next);
+        if (!be->stacked) {
+            be->stacked = true;
+            STAILQ_INSERT_TAIL(&t->be_head, be, be_next);
             be_count++;
         }
     }
@@ -271,14 +271,14 @@ static void proxy_event_handler(evutil_socket_t fd, short which, void *arg) {
     pthread_mutex_unlock(&t->mutex);
 
     // Re-walk each backend and check set event as required.
-    mcp_server_t *s = NULL;
+    mcp_backend_t *be = NULL;
     struct timeval tmp_time = {5,0}; // FIXME: temporary hard coded timeout.
 
     // FIXME: _set_event() is buggy, see notes on function.
-    STAILQ_FOREACH(s, &t->be_head, be_next) {
-        s->stacked = false;
-        int flags = s->can_write ? EV_READ|EV_TIMEOUT : EV_READ|EV_WRITE|EV_TIMEOUT;
-        _set_event(s, t->base, flags, tmp_time);
+    STAILQ_FOREACH(be, &t->be_head, be_next) {
+        be->stacked = false;
+        int flags = be->can_write ? EV_READ|EV_TIMEOUT : EV_READ|EV_WRITE|EV_TIMEOUT;
+        _set_event(be, t->base, flags, tmp_time);
     }
 
 }
@@ -297,22 +297,22 @@ static void *proxy_event_io_thread(void *arg) {
         }
 
         // Get a backend to process.
-        mcp_server_t *s = ev->iter;
+        mcp_backend_t *be = ev->iter;
         // bump the iterator for the next thread.
-        ev->iter = STAILQ_NEXT(s, be_next);
+        ev->iter = STAILQ_NEXT(be, be_next);
         pthread_mutex_unlock(&ev->mutex);
 
         // If we're in a connecting state, simply skip the flush here and let
         // the event thread wait for a write event.
-        if (s->connecting) {
+        if (be->connecting) {
             continue;
         }
         // FIXME: move to a function so we can call this from
-        // proxy_server_handler.
+        // proxy_backend_handler.
         io_pending_proxy_t *io = NULL;
         int flags = 0;
-        STAILQ_FOREACH(io, &s->io_head, io_next) {
-            flags |= _flush_pending_write(s, io);
+        STAILQ_FOREACH(io, &be->io_head, io_next) {
+            flags |= _flush_pending_write(be, io);
             if (flags & EV_WRITE) {
                 break;
             }
@@ -427,7 +427,7 @@ void proxy_init(void) {
         exit(EXIT_FAILURE);
     }
 
-    // call the mcp_config_selectors function to get the central servers.
+    // call the mcp_config_selectors function to get the central backends.
     lua_getglobal(L, "mcp_config_selectors");
 
     // TODO: handle explicitly if function is missing.
@@ -444,13 +444,13 @@ void proxy_init(void) {
 static int _copy_hash_selector(lua_State *from, lua_State *to) {
     // from, -3 should have he userdata.
     mcp_hash_selector_t *ss = luaL_checkudata(from, -3, "mcp.hash_selector");
-    size_t size = sizeof(mcp_hash_selector_t) + sizeof(mcp_hash_selector_srv_t) * ss->pool_size;
+    size_t size = sizeof(mcp_hash_selector_t) + sizeof(mcp_hash_selector_be_t) * ss->pool_size;
     mcp_hash_selector_t *css = lua_newuserdatauv(to, size, 0);
     luaL_setmetatable(to, "mcp.hash_selector");
     // TODO: check css.
 
     // TODO: we just straight copy the references here, pointing at the
-    // mcp.server's from the config without actually holding proper
+    // mcp.backend's from the config without actually holding proper
     // references!
     // This is done today because there's no code reload.
     // To implement code reload this will need to add references to the
@@ -804,28 +804,28 @@ static void proxy_lua_ferror(lua_State *L, const char *fmt, ...) {
 
 // FIXME: if we use the newer API the various pending checks can be adjusted.
 // FIXME: If we already had EV_READ but need to add EV_WRITE, this fails.
-static void _set_event(mcp_server_t *s, struct event_base *base, int flags, struct timeval t) {
+static void _set_event(mcp_backend_t *be, struct event_base *base, int flags, struct timeval t) {
     // FIXME: chicken and egg.
     // can't check if pending if the structure is was calloc'ed (sigh)
     // don't want to double test here. should be able to event_assign but
     // not add anything during initialization, but need the owner thread's
     // event base.
     int pending = 0;
-    if (event_initialized(&s->event)) {
-        pending = event_pending(&s->event, EV_READ|EV_WRITE|EV_TIMEOUT, NULL);
+    if (event_initialized(&be->event)) {
+        pending = event_pending(&be->event, EV_READ|EV_WRITE|EV_TIMEOUT, NULL);
     }
     if ((pending & (EV_READ|EV_WRITE)) == 0) {
         if (pending & EV_TIMEOUT) {
-            event_del(&s->event); // in case there's an EV_TIMEOUT already.
+            event_del(&be->event); // in case there's an EV_TIMEOUT already.
         }
 
         // if we can't write, we could be connecting.
         // TODO: always checking for READ in case some commands were sent
-        // successfully. The flags could be tracked on *s and reset in the
+        // successfully. The flags could be tracked on *be and reset in the
         // handler, perhaps?
-        event_assign(&s->event, base, mcmc_fd(s->client),
-                flags, proxy_server_handler, s);
-        event_add(&s->event, &t);
+        event_assign(&be->event, base, mcmc_fd(be->client),
+                flags, proxy_backend_handler, be);
+        event_add(&be->event, &t);
     }
 }
 
@@ -902,12 +902,12 @@ static int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t 
 }
 
 // TODO:
-// - mcp_server_read: grab req_stack_head, do things
+// - mcp_backend_read: grab req_stack_head, do things
 // read -> next, want_read -> next | read_end, etc.
 // issue: want read back to read_end as necessary. special state?
 //   - it's fine: p->client_resp->type.
-// - mcp_server_next: advance, consume, etc.
-static int proxy_server_drive_machine(mcp_server_t *s) {
+// - mcp_backend_next: advance, consume, etc.
+static int proxy_backend_drive_machine(mcp_backend_t *be) {
     bool stop = false;
     io_pending_proxy_t *p = NULL;
     mcmc_resp_t tmp_resp; // helper for testing for GET's END marker.
@@ -920,18 +920,18 @@ static int proxy_server_drive_machine(mcp_server_t *s) {
         int status = 0;
         char *newbuf = NULL;
 
-    switch(s->state) {
-        case mcp_server_read:
-            p = STAILQ_FIRST(&s->io_head);
+    switch(be->state) {
+        case mcp_backend_read:
+            p = STAILQ_FIRST(&be->io_head);
             assert(p != NULL);
             // FIXME: get the buffer from thread?
-            if (s->rbuf == NULL) {
-                s->rbuf = malloc(READ_BUFFER_SIZE);
+            if (be->rbuf == NULL) {
+                be->rbuf = malloc(READ_BUFFER_SIZE);
             }
             // TODO: check rbuf.
             r = p->client_resp;
 
-            r->status = mcmc_read(s->client, s->rbuf, READ_BUFFER_SIZE, &r->resp);
+            r->status = mcmc_read(be->client, be->rbuf, READ_BUFFER_SIZE, &r->resp);
             if (r->status != MCMC_OK) {
                 // TODO: ??? reduce io_pending and break?
                 // TODO: check for WANT_READ and re-add the event.
@@ -981,18 +981,18 @@ static int proxy_server_drive_machine(mcp_server_t *s) {
 
                 if (r->resp.vlen == r->resp.vlen_read) {
                     // TODO: some mcmc func for pulling the whole buffer?
-                    memcpy(r->buf, s->rbuf, r->blen);
+                    memcpy(r->buf, be->rbuf, r->blen);
                 } else {
                     // TODO: mcmc func for pulling the res off the buffer?
-                    memcpy(r->buf, s->rbuf, r->resp.reslen);
+                    memcpy(r->buf, be->rbuf, r->resp.reslen);
                     // got a partial read on the value, pull in the rest.
                     r->bread = 0;
-                    status = mcmc_read_value(s->client, r->buf+r->resp.reslen, r->resp.vlen, &r->bread);
+                    status = mcmc_read_value(be->client, r->buf+r->resp.reslen, r->resp.vlen, &r->bread);
                     if (status == MCMC_OK) {
                         // all done copying data.
                     } else if (status == MCMC_WANT_READ) {
                         // need to retry later.
-                        s->state = mcp_server_want_read;
+                        be->state = mcp_backend_want_read;
                         flags |= EV_READ;
                         stop = true;
                         break;
@@ -1006,33 +1006,33 @@ static int proxy_server_drive_machine(mcp_server_t *s) {
             }
 
             if (r->resp.type == MCMC_RESP_GET) {
-                s->state = mcp_server_read_end;
+                be->state = mcp_backend_read_end;
             } else {
-                s->state = mcp_server_next;
+                be->state = mcp_backend_next;
             }
 
             break;
-        case mcp_server_read_end:
-            p = STAILQ_FIRST(&s->io_head);
+        case mcp_backend_read_end:
+            p = STAILQ_FIRST(&be->io_head);
             r = p->client_resp;
             // we need to advance the buffer and ensure the next data
             // in the stream is "END\r\n"
             // if not, the stack is desynced and we lose it.
-            newbuf = mcmc_buffer_consume(s->client, &remain);
+            newbuf = mcmc_buffer_consume(be->client, &remain);
 
             if (remain > ENDLEN) {
                 // enough bytes in the buffer for our potential END
                 // marker, so lets avoid an unnecessary memmove.
             } else if (remain != 0) {
                 // TODO: don't necessarily need to shovel the buffer.
-                memmove(s->rbuf, newbuf, remain);
-                newbuf = s->rbuf;
+                memmove(be->rbuf, newbuf, remain);
+                newbuf = be->rbuf;
             } else {
-                newbuf = s->rbuf;
+                newbuf = be->rbuf;
             }
 
             // TODO: WANT_READ can happen here.
-            status = mcmc_read(s->client, newbuf, READ_BUFFER_SIZE-remain, &tmp_resp);
+            status = mcmc_read(be->client, newbuf, READ_BUFFER_SIZE-remain, &tmp_resp);
             if (status != MCMC_OK) {
                 // TODO: something?
             } else if (tmp_resp.type != MCMC_RESP_END) {
@@ -1044,20 +1044,20 @@ static int proxy_server_drive_machine(mcp_server_t *s) {
                 r->blen += 5;
             }
 
-            s->state = mcp_server_next;
+            be->state = mcp_backend_next;
 
             break;
-        case mcp_server_want_read:
+        case mcp_backend_want_read:
             // Continuing a read from earlier
-            p = STAILQ_FIRST(&s->io_head);
+            p = STAILQ_FIRST(&be->io_head);
             r = p->client_resp;
-            status = mcmc_read_value(s->client, r->buf+r->resp.reslen, r->resp.vlen, &r->bread);
+            status = mcmc_read_value(be->client, r->buf+r->resp.reslen, r->resp.vlen, &r->bread);
             if (status == MCMC_OK) {
                 // all done copying data.
                 if (r->resp.type == MCMC_RESP_GET) {
-                    s->state = mcp_server_read_end;
+                    be->state = mcp_backend_read_end;
                 } else {
-                    s->state = mcp_server_next;
+                    be->state = mcp_backend_next;
                 }
             } else if (status == MCMC_WANT_READ) {
                 // need to retry later.
@@ -1068,10 +1068,10 @@ static int proxy_server_drive_machine(mcp_server_t *s) {
             }
 
             break;
-        case mcp_server_next:
+        case mcp_backend_next:
             // set the head here. when we break the head will be correct.
-            STAILQ_REMOVE_HEAD(&s->io_head, io_next);
-            if (STAILQ_EMPTY(&s->io_head)) {
+            STAILQ_REMOVE_HEAD(&be->io_head, io_next);
+            if (STAILQ_EMPTY(&be->io_head)) {
                 // TODO: suspicious of this code. audit harder?
                 stop = true;
             }
@@ -1092,21 +1092,21 @@ static int proxy_server_drive_machine(mcp_server_t *s) {
             // event.
             remain = 0;
             // TODO: do we need to yield every N reads?
-            newbuf = mcmc_buffer_consume(s->client, &remain);
+            newbuf = mcmc_buffer_consume(be->client, &remain);
             if (remain != 0) {
                 // data trailing in the buffer, for a different request.
-                memmove(s->rbuf, newbuf, remain);
+                memmove(be->rbuf, newbuf, remain);
             } else {
                 // TODO: signal back to read?
                 stop = true;
             }
 
-            s->state = mcp_server_read;
+            be->state = mcp_backend_read;
             // TODO: stop if req_stack_head is empty now?
 
             break;
         default:
-            fprintf(stderr, "invalid state: %d\n", s->state);
+            fprintf(stderr, "invalid state: %d\n", be->state);
             assert(false);
     } // switch
     } // while
@@ -1116,7 +1116,7 @@ static int proxy_server_drive_machine(mcp_server_t *s) {
 
 // TODO: this function is incomplete:
 // - error propagation
-static int _flush_pending_write(mcp_server_t *s, io_pending_proxy_t *p) {
+static int _flush_pending_write(mcp_backend_t *be, io_pending_proxy_t *p) {
     int flags = 0;
 
     if (p->flushed) {
@@ -1129,7 +1129,7 @@ static int _flush_pending_write(mcp_server_t *s, io_pending_proxy_t *p) {
     // we supply.
     // this is probably okay but I want to leave a note here in case I get a
     // better idea.
-    int status = mcmc_request_writev(s->client, p->iov, p->iovcnt, &sent, 1);
+    int status = mcmc_request_writev(be->client, p->iov, p->iovcnt, &sent, 1);
     if (sent > 0) {
         // we need to save progress in case of WANT_WRITE.
         for (int x = 0; x < p->iovcnt; x++) {
@@ -1148,7 +1148,7 @@ static int _flush_pending_write(mcp_server_t *s, io_pending_proxy_t *p) {
     // request_writev() returns WANT_WRITE if we haven't fully flushed.
     if (status == MCMC_WANT_WRITE) {
         // avoid syscalls for any other queued requests.
-        s->can_write = false;
+        be->can_write = false;
         flags |= EV_WRITE;
         return flags; // can't continue for now.
     } else if (status != MCMC_OK) {
@@ -1166,8 +1166,8 @@ static int _flush_pending_write(mcp_server_t *s, io_pending_proxy_t *p) {
 
 // The libevent callback handler.
 // TODO: replace function?
-static void proxy_server_handler(const int fd, const short which, void *arg) {
-    mcp_server_t *s = arg;
+static void proxy_backend_handler(const int fd, const short which, void *arg) {
+    mcp_backend_t *be = arg;
     int flags = EV_TIMEOUT;
     struct timeval tmp_time = {5,0}; // FIXME: temporary hard coded response timeout.
 
@@ -1181,24 +1181,24 @@ static void proxy_server_handler(const int fd, const short which, void *arg) {
     }
 
     if (which & EV_WRITE) {
-        s->can_write = true;
+        be->can_write = true;
         // TODO: move connect routine to its own function?
-        if (s->connecting) {
+        if (be->connecting) {
             int err = 0;
             // We were connecting, now ensure we're properly connected.
-            if (mcmc_check_nonblock_connect(s->client, &err) != MCMC_OK) {
+            if (mcmc_check_nonblock_connect(be->client, &err) != MCMC_OK) {
                 // TODO: for now we kill the stack. need to retry a few times
                 // first.
                 // TODO: will need a mechanism for max retries, waits between
                 // fast-fails, and failing the stack equivalent to a timeout.
                 assert(1 == 0);
             }
-            s->connecting = false;
+            be->connecting = false;
         }
         // TODO: another wrapper function? This loop is duplicated.
         io_pending_proxy_t *io = NULL;
-        STAILQ_FOREACH(io, &s->io_head, io_next) {
-            flags |= _flush_pending_write(s, io);
+        STAILQ_FOREACH(io, &be->io_head, io_next) {
+            flags |= _flush_pending_write(be, io);
             if (flags & EV_WRITE) {
                 break;
             }
@@ -1206,13 +1206,13 @@ static void proxy_server_handler(const int fd, const short which, void *arg) {
     }
 
     if (which & EV_READ) {
-        flags |= proxy_server_drive_machine(s);
+        flags |= proxy_backend_drive_machine(be);
     }
 
     // Still pending requests to read or write.
     // TODO: need to handle errors from above so we don't go to sleep here.
-    if (!STAILQ_EMPTY(&s->io_head)) {
-        _set_event(s, s->event_thread->base, flags, tmp_time);
+    if (!STAILQ_EMPTY(&be->io_head)) {
+        _set_event(be, be->event_thread->base, flags, tmp_time);
     }
 }
 
@@ -1282,7 +1282,7 @@ static void mcp_queue_io(conn *c, int coro_ref, lua_State *Lc) {
     // stack: request, hash selector. latter just to hold a reference.
 
     mcp_request_t *rq = luaL_checkudata(Lc, -1, "mcp.request");
-    mcp_server_t *s = rq->srv;
+    mcp_backend_t *be = rq->be;
     // FIXME: need to check for "if request modified" and recreate it.
     // Use a local function rather than calling __tostring through lua.
 
@@ -1322,8 +1322,8 @@ static void mcp_queue_io(conn *c, int coro_ref, lua_State *Lc) {
     // on re-fetching it later. The pointer shouldn't change.
     p->coro = Lc;
 
-    // The direct server object. Lc is holding the reference in the stack
-    p->server = s;
+    // The direct backend object. Lc is holding the reference in the stack
+    p->backend = be;
 
     // The stringified request. This is also referencing into the coroutine
     // stack, which should be safe from gc.
@@ -1395,54 +1395,54 @@ static int mcplib_response_gc(lua_State *L) {
     return 0;
 }
 
-static int mcplib_server(lua_State *L) {
+static int mcplib_backend(lua_State *L) {
     const char *ip = luaL_checkstring(L, -3); // FIXME: checklstring?
     const char *port = luaL_checkstring(L, -2);
     double weight = luaL_checknumber(L, -1);
 
     // This might shift to internal objects?
-    mcp_server_t *s = lua_newuserdatauv(L, sizeof(mcp_server_t), 0);
-    if (s == NULL) {
+    mcp_backend_t *be = lua_newuserdatauv(L, sizeof(mcp_backend_t), 0);
+    if (be == NULL) {
         proxy_lua_error(L, "out of memory allocating server");
         return 0;
     }
     
-    strncpy(s->ip, ip, MAX_IPLEN);
-    strncpy(s->port, port, MAX_PORTLEN);
-    s->weight = weight;
-    s->rbuf = NULL;
-    STAILQ_INIT(&s->io_head);
-    s->state = mcp_server_read;
-    s->connecting = false;
-    s->can_write = false;
-    s->stacked = false;
+    strncpy(be->ip, ip, MAX_IPLEN);
+    strncpy(be->port, port, MAX_PORTLEN);
+    be->weight = weight;
+    be->rbuf = NULL;
+    STAILQ_INIT(&be->io_head);
+    be->state = mcp_backend_read;
+    be->connecting = false;
+    be->can_write = false;
+    be->stacked = false;
 
     // initialize libevent.
-    memset(&s->event, 0, sizeof(s->event));
+    memset(&be->event, 0, sizeof(be->event));
 
     // initialize the client
-    s->client = malloc(mcmc_size(MCMC_OPTION_BLANK));
-    if (s->client == NULL) {
-        proxy_lua_error(L, "out of memory allocating server");
+    be->client = malloc(mcmc_size(MCMC_OPTION_BLANK));
+    if (be->client == NULL) {
+        proxy_lua_error(L, "out of memory allocating backend");
         return 0;
     }
     // TODO: connect elsewhere? Any reason not to immediately shoot off a
     // connect?
-    int status = mcmc_connect(s->client, s->ip, s->port, MCMC_OPTION_NONBLOCK);
+    int status = mcmc_connect(be->client, be->ip, be->port, MCMC_OPTION_NONBLOCK);
     if (status == MCMC_CONNECTED) {
         // FIXME: is this possible? do we ever want to allow blocking
         // connections?
-        proxy_lua_ferror(L, "unexpectedly connected to backend early: %s:%s\n", s->ip, s->port);
+        proxy_lua_ferror(L, "unexpectedly connected to backend early: %s:%s\n", be->ip, be->port);
         return 0;
     } else if (status == MCMC_CONNECTING) {
-        s->connecting = true;
-        s->can_write = false;
+        be->connecting = true;
+        be->can_write = false;
     } else {
-        proxy_lua_ferror(L, "failed to connect to backend: %s:%s\n", s->ip, s->port);
+        proxy_lua_ferror(L, "failed to connect to backend: %s:%s\n", be->ip, be->port);
         return 0;
     }
 
-    luaL_getmetatable(L, "mcp.server");
+    luaL_getmetatable(L, "mcp.backend");
     lua_setmetatable(L, -2); // set metatable to userdata.
 
     return 1;
@@ -1457,7 +1457,7 @@ static int mcplib_hash_selector(lua_State *L) {
 
     // TODO: this'll have to change to a pointer, since that pointer will get
     // shuffled off somewhere else.
-    mcp_hash_selector_t *ss = lua_newuserdatauv(L, sizeof(mcp_hash_selector_t) + sizeof(mcp_hash_selector_srv_t) * n, 0);
+    mcp_hash_selector_t *ss = lua_newuserdatauv(L, sizeof(mcp_hash_selector_t) + sizeof(mcp_hash_selector_be_t) * n, 0);
     // TODO: check ss.
     ss->pool_size = n;
 
@@ -1468,12 +1468,12 @@ static int mcplib_hash_selector(lua_State *L) {
     // TODO: we need a second array with luaL_ref()'s to each of the servers.
     // or an array of structs which hold ptr's.
     for (int x = 1; x <= n; x++) {
-        mcp_hash_selector_srv_t *s = &ss->pool[x-1];
+        mcp_hash_selector_be_t *s = &ss->pool[x-1];
         lua_geti(L, -2, x); // get next server into the stack.
         // TODO: do we leak memory if we bail here?
         // the stack should clear, then release the userdata + etc?
         // - yes it should leak memory for the registry indexed items.
-        s->srv = luaL_checkudata(L, -1, "mcp.server");
+        s->be = luaL_checkudata(L, -1, "mcp.backend");
         s->ref = luaL_ref(L, LUA_REGISTRYINDEX); // references and pops object.
     }
 
@@ -1484,7 +1484,7 @@ static int mcplib_hash_selector(lua_State *L) {
     return 1;
 }
 
-// hashfunc(request) -> server(request)
+// hashfunc(request) -> backend(request)
 // needs key from request object.
 // TODO: if creating a custom request from lua this will need to change a bit.
 static int mcplib_hash_selector_call(lua_State *L) {
@@ -1499,9 +1499,9 @@ static int mcplib_hash_selector_call(lua_State *L) {
     size_t len = rq->tokens[KEY_TOKEN].length;
     uint32_t hash = ss->func(key, len);
 
-    // attach the server to the request object.
+    // attach the backend to the request object.
     // save CPU cycles over rolling it through lua.
-    rq->srv = ss->pool[hash % ss->pool_size].srv;
+    rq->be = ss->pool[hash % ss->pool_size].be;
 
     // now yield request, hash selector up.
     return lua_yield(L, 2);
@@ -1806,7 +1806,7 @@ int proxy_register_libs(LIBEVENT_THREAD *t, void *ctx) {
     // then if no pools/code has references still, can ditch?
     // TODO: __gc
     // TODO: __call - called when... called like a function!
-    const struct luaL_Reg mcplib_server_m [] = {
+    const struct luaL_Reg mcplib_backend_m[] = {
         {"set", NULL},
         {NULL, NULL}
     };
@@ -1833,16 +1833,16 @@ int proxy_register_libs(LIBEVENT_THREAD *t, void *ctx) {
 
     const struct luaL_Reg mcplib_f [] = {
         {"hash_selector", mcplib_hash_selector},
-        {"server", mcplib_server},
+        {"backend", mcplib_backend},
         {"attach", mcplib_attach},
         {NULL, NULL}
     };
 
     // TODO: function + loop.
-    luaL_newmetatable(L, "mcp.server");
+    luaL_newmetatable(L, "mcp.backend");
     lua_pushvalue(L, -1); // duplicate metatable.
     lua_setfield(L, -2, "__index"); // mt.__index = mt
-    luaL_setfuncs(L, mcplib_server_m, 0); // register methods
+    luaL_setfuncs(L, mcplib_backend_m, 0); // register methods
     lua_pop(L, 1);
 
     luaL_newmetatable(L, "mcp.request");

@@ -10,9 +10,9 @@ local my_zone = 'z1'
 
 function mcp_config_selectors(oldss)
 
-    -- alias mcp.server for convenience.
+    -- alias mcp.backend for convenience.
     -- important to alias global variables in routes where speed is concerned.
-    local srv = mcp.server
+    local srv = mcp.backend
     -- local zones = { 'z1', 'z2', 'z3' }
 
     -- IPs are "127" . "zone" . "pool" . "srv"
