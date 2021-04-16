@@ -26,7 +26,7 @@
 #define MCP_ATTACH_UPVALUE 2
 
 // TODO: move to config option.
-#define BACKEND_IO_THREADS 4
+#define PROXY_EVENT_IO_THREADS 4
 
 typedef uint32_t (*hash_selector_func)(const void *key, size_t len);
 typedef struct {
@@ -93,7 +93,7 @@ struct mcp_server_s {
 };
 typedef STAILQ_HEAD(be_head_s, mcp_server_s) be_head_t;
 
-typedef struct proxy_backend_thread_s proxy_backend_thread_t;
+typedef struct proxy_event_io_thread_s proxy_event_io_thread_t;
 struct proxy_event_thread_s {
     pthread_t thread_id;
     struct event_base *base;
@@ -103,13 +103,13 @@ struct proxy_event_thread_s {
     io_head_t io_head_in; // inbound requests to process.
     be_head_t be_head; // stack of backends for processing.
     mcp_server_t *iter; // used as an iterator through the be list
-    proxy_backend_thread_t *bt; // array of backend threads.
+    proxy_event_io_thread_t *bt; // array of io threads.
     int notify_receive_fd;
     int notify_send_fd;
 };
 
 // threads owned by an event thread for submitting syscalls.
-struct proxy_backend_thread_s {
+struct proxy_event_io_thread_s {
     pthread_t thread_id;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
@@ -207,7 +207,7 @@ static const char * _load_helper(lua_State *L, void *data, size_t *size) {
 // handler for adding requests to a server's queue.
 // FIXME: is this going to get mass fired even though we're batching here?
 // FIXME: rename to proxy_evthread_handler ?
-static void proxy_backend_handler(evutil_socket_t fd, short which, void *arg) {
+static void proxy_event_handler(evutil_socket_t fd, short which, void *arg) {
     proxy_event_thread_t *t = arg;
     io_head_t head;
 
@@ -253,8 +253,8 @@ static void proxy_backend_handler(evutil_socket_t fd, short which, void *arg) {
     // TODO: if IO count is low, run in-line.
     // IO requests are now stacked into per-backend queues.
     // we do this here to avoid needing mutexes on backends.
-    for (int x = 0; x < BACKEND_IO_THREADS; x++) {
-        proxy_backend_thread_t *bt = &t->bt[x];
+    for (int x = 0; x < PROXY_EVENT_IO_THREADS; x++) {
+        proxy_event_io_thread_t *bt = &t->bt[x];
         pthread_cond_signal(&bt->cond);
         if (x == be_count)
             break;
@@ -283,9 +283,8 @@ static void proxy_backend_handler(evutil_socket_t fd, short which, void *arg) {
 
 }
 
-// TODO: rename to evthread_syscall_worker ?
-static void *backend_thread_worker(void *arg) {
-    proxy_backend_thread_t *t = arg;
+static void *proxy_event_io_thread(void *arg) {
+    proxy_event_io_thread_t *t = arg;
     pthread_mutex_lock(&t->mutex);
     while (1) {
         proxy_event_thread_t *ev = t->ev;
@@ -324,20 +323,20 @@ static void *backend_thread_worker(void *arg) {
     return NULL;
 }
 
-static void *proxy_event_worker(void *arg) {
+static void *proxy_event_thread(void *arg) {
     proxy_event_thread_t *t = arg;
 
     // create our dedicated backend threads for syscall fanout.
-    t->bt = calloc(BACKEND_IO_THREADS, sizeof(proxy_backend_thread_t));
+    t->bt = calloc(PROXY_EVENT_IO_THREADS, sizeof(proxy_event_io_thread_t));
     assert(t->bt != NULL); // TODO: unlikely malloc error.
-    for (int x = 0;x < BACKEND_IO_THREADS; x++) {
-        proxy_backend_thread_t *bt = &t->bt[x];
+    for (int x = 0;x < PROXY_EVENT_IO_THREADS; x++) {
+        proxy_event_io_thread_t *bt = &t->bt[x];
         bt->ev = t;
         pthread_mutex_init(&bt->mutex, NULL);
         pthread_cond_init(&bt->cond, NULL);
 
         // TODO: second null is func.
-        pthread_create(&bt->thread_id, NULL, backend_thread_worker, bt);
+        pthread_create(&bt->thread_id, NULL, proxy_event_io_thread, bt);
     }
 
     event_base_loop(t->base, 0);
@@ -406,7 +405,7 @@ void proxy_init(void) {
         // NULL was thread_libevent_process
         // FIXME: use modern format? (event_assign)
         event_set(&t->notify_event, t->notify_receive_fd,
-              EV_READ | EV_PERSIST, proxy_backend_handler, t);
+              EV_READ | EV_PERSIST, proxy_event_handler, t);
         event_base_set(t->base, &t->notify_event);
         if (event_add(&t->notify_event, 0) == -1) {
             fprintf(stderr, "Can't monitor libevent notify pipe\n");
@@ -418,7 +417,7 @@ void proxy_init(void) {
         pthread_mutex_init(&t->mutex, NULL);
         pthread_cond_init(&t->cond, NULL);
 
-        pthread_create(&t->thread_id, NULL, proxy_event_worker, t);
+        pthread_create(&t->thread_id, NULL, proxy_event_thread, t);
     }
 
     // now we complete the data load by calling the function.
