@@ -16,6 +16,16 @@
 #include "murmur3_hash.h"
 #include "queue.h"
 
+// TODO: better if an init option turns this on/off.
+#ifdef PROXY_DEBUG
+#define P_DEBUG(...) \
+    do { \
+        fprintf(stderr, __VA_ARGS__); \
+    } while (0)
+#else
+#define P_DEBUG(...)
+#endif
+
 // FIXME: do include dir properly.
 #include "vendor/mcmc/mcmc.h"
 
