@@ -172,7 +172,7 @@ typedef struct {
 static int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t *p, conn *c);
 static void proxy_process_command(conn *c, char *command, size_t cmdlen);
 static void dump_stack(lua_State *L);
-static void mcp_queue_io(conn *c, int coro_ref, lua_State *Lc);
+static void mcp_queue_io(conn *c, mc_resp *resp, int coro_ref, lua_State *Lc);
 static mcp_request_t *mcp_new_request(lua_State *L, char *command, size_t cmdlen);
 static void proxy_backend_handler(const int fd, const short which, void *arg);
 static void proxy_out_errstring(mc_resp *resp, const char *str);
@@ -917,8 +917,10 @@ static int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t 
         // though.
 
         int coro_ref = 0;
+        mc_resp *resp;
         if (p != NULL) {
             coro_ref = p->coro_ref;
+            resp = p->resp;
             c = p->c;
             do_cache_free(p->c->thread->io_cache, p);
             // *p is now dead.
@@ -931,8 +933,10 @@ static int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t 
             // we're reaching back into the main thread's stack.
             assert(c != NULL);
             coro_ref = luaL_ref(c->thread->L, LUA_REGISTRYINDEX);
+            resp = c->resp;
         }
-        mcp_queue_io(c, coro_ref, Lc);
+        // TODO: c only used for cache alloc? push the above into the func?
+        mcp_queue_io(c, resp, coro_ref, Lc);
     } else {
         // error?
         fprintf(stderr, "CFailed to run coroutine: %s\n", lua_tostring(Lc, -1));
@@ -1329,9 +1333,8 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen) {
 // connection's response object. stack enough information to write to the
 // server on the submit callback, and enough to resume the lua state on the
 // completion callback.
-static void mcp_queue_io(conn *c, int coro_ref, lua_State *Lc) {
+static void mcp_queue_io(conn *c, mc_resp *resp, int coro_ref, lua_State *Lc) {
     io_queue_t *q = conn_io_queue_get(c, IO_QUEUE_PROXY);
-    mc_resp *resp = c->resp;
 
     // stack: request, hash selector. latter just to hold a reference.
 

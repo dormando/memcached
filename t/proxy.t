@@ -22,12 +22,27 @@ my $builddir = getcwd;
 my $srv = run_server('-p 11212', 11212);
 my $sock = $srv->sock;
 
+# hack to help me use T_MEMD_USE_DAEMON for proxy.
+#print STDERR "Sleeping\n";
+#sleep 4;
+
 my $p_srv = new_memcached('-o proxy_config=./t/startfile.lua');
 my $p_sock = $p_srv->sock;
 
 # set through proxy.
 {
     print $p_sock "set /foo/z 0 0 5\r\nhello\r\n";
+    is(scalar <$p_sock>, "STORED\r\n", "stored test value through proxy");
+}
+
+# pipelined set.
+{
+    my $str = "set /foo/k 0 0 5\r\nhello\r\n";
+    print $p_sock "$str$str$str$str$str";
+    is(scalar <$p_sock>, "STORED\r\n", "stored test value through proxy");
+    is(scalar <$p_sock>, "STORED\r\n", "stored test value through proxy");
+    is(scalar <$p_sock>, "STORED\r\n", "stored test value through proxy");
+    is(scalar <$p_sock>, "STORED\r\n", "stored test value through proxy");
     is(scalar <$p_sock>, "STORED\r\n", "stored test value through proxy");
 }
 
