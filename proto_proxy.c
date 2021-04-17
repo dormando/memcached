@@ -240,7 +240,7 @@ static void proxy_event_handler(evutil_socket_t fd, short which, void *arg) {
 
     int io_count = 0;
     int be_count = 0;
-    while(!STAILQ_EMPTY(&head)) {
+    while (!STAILQ_EMPTY(&head)) {
         io_pending_proxy_t *io = STAILQ_FIRST(&head);
         io->flushed = false;
         mcp_backend_t *be = io->backend;
@@ -259,11 +259,18 @@ static void proxy_event_handler(evutil_socket_t fd, short which, void *arg) {
         }
     }
 
+    if (io_count == 0) {
+        P_DEBUG("%s: no IO's to complete\n", __func__);
+        return;
+    }
     //P_DEBUG("%s: io/be counts for syscalls [%d/%d]\n", __func__, io_count, be_count);
 
+    pthread_mutex_lock(&t->mutex);
     // initialize iterator.
     t->iter = STAILQ_FIRST(&t->be_head);
-    pthread_mutex_lock(&t->mutex);
+    // FIXME: this loop is only correct if all io threads are definitely
+    // waiting before we lock the ev mutex.
+    // need to confirm if we have to lock the bt->mutex's first for sure.
 
     // TODO: if IO count is low, run in-line.
     // IO requests are now stacked into per-backend queues.
@@ -273,7 +280,7 @@ static void proxy_event_handler(evutil_socket_t fd, short which, void *arg) {
         pthread_mutex_lock(&bt->mutex);
         pthread_cond_signal(&bt->cond);
         pthread_mutex_unlock(&bt->mutex);
-        if (x == be_count)
+        if (x == be_count-1)
             break;
     }
 
@@ -299,14 +306,16 @@ static void proxy_event_handler(evutil_socket_t fd, short which, void *arg) {
 
 static void *proxy_event_io_thread(void *arg) {
     proxy_event_io_thread_t *t = arg;
-    pthread_mutex_lock(&t->mutex);
     while (1) {
+        bool signal = false;
         proxy_event_thread_t *ev = t->ev;
         pthread_mutex_lock(&ev->mutex);
         if (ev->iter == NULL) {
-            pthread_cond_signal(&ev->cond);
+            pthread_mutex_lock(&t->mutex);
             pthread_mutex_unlock(&ev->mutex);
+
             pthread_cond_wait(&t->cond, &t->mutex);
+            pthread_mutex_unlock(&t->mutex);
             continue;
         }
 
@@ -314,25 +323,28 @@ static void *proxy_event_io_thread(void *arg) {
         mcp_backend_t *be = ev->iter;
         // bump the iterator for the next thread.
         ev->iter = STAILQ_NEXT(be, be_next);
+        if (ev->iter == NULL)
+            signal = true;
         pthread_mutex_unlock(&ev->mutex);
 
         // If we're in a connecting state, simply skip the flush here and let
         // the event thread wait for a write event.
         if (be->connecting) {
             P_DEBUG("%s: deferring IO pending connecting\n", __func__);
-            continue;
-        }
-        // FIXME: move to a function so we can call this from
-        // proxy_backend_handler.
-        io_pending_proxy_t *io = NULL;
-        int flags = 0;
-        STAILQ_FOREACH(io, &be->io_head, io_next) {
-            flags |= _flush_pending_write(be, io);
-            if (flags & EV_WRITE) {
-                break;
+        } else {
+            // FIXME: move to a function so we can call this from
+            // proxy_backend_handler.
+            io_pending_proxy_t *io = NULL;
+            int flags = 0;
+            STAILQ_FOREACH(io, &be->io_head, io_next) {
+                flags |= _flush_pending_write(be, io);
+                if (flags & EV_WRITE) {
+                    break;
+                }
             }
         }
-
+        if (signal)
+            pthread_cond_signal(&ev->cond);
     }
 
     return NULL;
@@ -350,7 +362,6 @@ static void *proxy_event_thread(void *arg) {
         pthread_mutex_init(&bt->mutex, NULL);
         pthread_cond_init(&bt->cond, NULL);
 
-        // TODO: second null is func.
         pthread_create(&bt->thread_id, NULL, proxy_event_io_thread, bt);
     }
 
