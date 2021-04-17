@@ -260,11 +260,13 @@ static void proxy_event_handler(evutil_socket_t fd, short which, void *arg) {
     }
 
     if (io_count == 0) {
-        P_DEBUG("%s: no IO's to complete\n", __func__);
+        //P_DEBUG("%s: no IO's to complete\n", __func__);
         return;
     }
     //P_DEBUG("%s: io/be counts for syscalls [%d/%d]\n", __func__, io_count, be_count);
 
+    /*
+    // TODO: see notes on proxy_event_io_thread
     pthread_mutex_lock(&t->mutex);
     // initialize iterator.
     t->iter = STAILQ_FIRST(&t->be_head);
@@ -290,6 +292,7 @@ static void proxy_event_handler(evutil_socket_t fd, short which, void *arg) {
     // wait for bg threads while iterator is still valid.
     pthread_cond_wait(&t->cond, &t->mutex);
     pthread_mutex_unlock(&t->mutex);
+    */
 
     // Re-walk each backend and check set event as required.
     mcp_backend_t *be = NULL;
@@ -298,12 +301,29 @@ static void proxy_event_handler(evutil_socket_t fd, short which, void *arg) {
     // FIXME: _set_event() is buggy, see notes on function.
     STAILQ_FOREACH(be, &t->be_head, be_next) {
         be->stacked = false;
+        if (be->connecting) {
+            P_DEBUG("%s: deferring IO pending connecting\n", __func__);
+        } else {
+            io_pending_proxy_t *io = NULL;
+            int flags = 0;
+            STAILQ_FOREACH(io, &be->io_head, io_next) {
+                flags |= _flush_pending_write(be, io);
+                if (flags & EV_WRITE) {
+                    break;
+                }
+            }
+
+        }
         int flags = be->can_write ? EV_READ|EV_TIMEOUT : EV_READ|EV_WRITE|EV_TIMEOUT;
         _set_event(be, t->base, flags, tmp_time);
     }
 
 }
 
+// TODO: this is unused while other parts of the code are fleshed out.
+// debugged a few race conditions, and as-is it ended up being slower in quick
+// tests than running the syscalls inline with the event thread.
+// If code is truly stable without this I will revisit it later.
 static void *proxy_event_io_thread(void *arg) {
     proxy_event_io_thread_t *t = arg;
     while (1) {
@@ -1123,7 +1143,7 @@ static int proxy_backend_drive_machine(mcp_backend_t *be) {
             if (remain != 0) {
                 // data trailing in the buffer, for a different request.
                 memmove(be->rbuf, newbuf, remain);
-                P_DEBUG("read buffer remaining: %d\n", remain);
+                //P_DEBUG("read buffer remaining: %d\n", remain);
             } else {
                 // FIXME: debugging.
                 memset(be->rbuf, 0, READ_BUFFER_SIZE);
@@ -1230,7 +1250,6 @@ static void proxy_backend_handler(const int fd, const short which, void *arg) {
         STAILQ_FOREACH(io, &be->io_head, io_next) {
             flags |= _flush_pending_write(be, io);
             if (flags & EV_WRITE) {
-                P_DEBUG("%s: EV_WRITE\n", __func__);
                 break;
             }
         }
@@ -1246,7 +1265,6 @@ static void proxy_backend_handler(const int fd, const short which, void *arg) {
     // Still pending requests to read or write.
     // TODO: need to handle errors from above so we don't go to sleep here.
     if (!STAILQ_EMPTY(&be->io_head)) {
-        P_DEBUG("backend depth: %d which: [%d]\n", be->depth, which);
         flags |= EV_READ; // FIXME: think we always need to check READ in case of a disconnect?
         _set_event(be, be->event_thread->base, flags, tmp_time);
     }
