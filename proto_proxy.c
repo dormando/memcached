@@ -173,7 +173,7 @@ static int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t 
 static void proxy_process_command(conn *c, char *command, size_t cmdlen);
 static void dump_stack(lua_State *L);
 static void mcp_queue_io(conn *c, mc_resp *resp, int coro_ref, lua_State *Lc);
-static mcp_request_t *mcp_new_request(lua_State *L, char *command, size_t cmdlen);
+static mcp_request_t *mcp_new_request(lua_State *L, const char *command, size_t cmdlen);
 static void proxy_backend_handler(const int fd, const short which, void *arg);
 static void proxy_out_errstring(mc_resp *resp, const char *str);
 static int _flush_pending_write(mcp_backend_t *be, io_pending_proxy_t *p);
@@ -1663,6 +1663,7 @@ static void proxy_register_defines(lua_State *L) {
 // "get key key"
 // TODO: perhaps this could/should live in mcmc.
 // TODO: return code ENUM with error types.
+// TODO: make *command const.
 static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
     // we want to "parse in place" as much as possible, which allows us to
     // forward an unmodified request without having to rebuild it.
@@ -1796,12 +1797,14 @@ static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
     rq->command = cmd;
 }
 
-static mcp_request_t *mcp_new_request(lua_State *L, char *command, size_t cmdlen) {
-    // TODO: reserve userdata value for key/etc overrides?
+static mcp_request_t *mcp_new_request(lua_State *L, const char *command, size_t cmdlen) {
+    // reserving an upvalue for key.
     mcp_request_t *rq = lua_newuserdatauv(L, sizeof(mcp_request_t), 1);
     memset(rq, 0, sizeof(mcp_request_t));
-    rq->request = command;
+    rq->request = malloc(cmdlen);
+    // TODO: check rq->request and lua-fail properly
     rq->reqlen = cmdlen;
+    memcpy(rq->request, command, cmdlen);
 
     luaL_getmetatable(L, "mcp.request");
     lua_setmetatable(L, -2);
@@ -1811,13 +1814,37 @@ static mcp_request_t *mcp_new_request(lua_State *L, char *command, size_t cmdlen
     // TODO: actually boost errors from request parser :P
     // need to keep in mind that parsing should be optionally strict, so we
     // can handle arbitrary text commands for proxy code.
-    process_request(rq, command, cmdlen);
+    process_request(rq, rq->request, cmdlen);
 
     // at this point we should know if we have to bounce through an nread to
     // get item data or not.
     // TODO: check flag or return code from process_request() and indicate to
     // caller, or return rq to caller so it can check.
     return rq;
+}
+
+// second argument is optional, for building set requests.
+// TODO: append the \r\n for the VAL?
+static int mcplib_request(lua_State *L) {
+    size_t len = 0;
+    size_t vlen = 0;
+    const char *cmd = luaL_checklstring(L, 1, &len);
+    // TODO: is *command something we could/should store into an upvalue?
+    const char *val = luaL_optlstring(L, 2, NULL, &vlen);
+    mcp_request_t *rq = mcp_new_request(L, cmd, len);
+
+    if (val != NULL) {
+        rq->vlen = vlen;
+        rq->buf = malloc(vlen);
+        // TODO: rq->buf
+        memcpy(rq->buf, val, vlen);
+    }
+
+    // rq is now created, parsed, and on the stack.
+    if (rq == NULL) {
+        // TODO: lua error.
+    }
+    return 1;
 }
 
 // TODO: trace lua to confirm keeping the string in the uservalue ensures we
@@ -1846,6 +1873,12 @@ static int mcplib_request_command(lua_State *L) {
 
 static int mcplib_request_gc(lua_State *L) {
     mcp_request_t *rq = luaL_checkudata(L, -1, "mcp.request");
+    if (rq->request != NULL) {
+        free(rq->request);
+    }
+    // FIXME: during nread c->item is the malloc'ed buffer. not yet put into
+    // rq->buf - is this properly freed if the connection dies before
+    // complete_nread?
     if (rq->buf != NULL) {
         free(rq->buf);
     }
@@ -1894,6 +1927,7 @@ int proxy_register_libs(LIBEVENT_THREAD *t, void *ctx) {
     const struct luaL_Reg mcplib_f [] = {
         {"hash_selector", mcplib_hash_selector},
         {"backend", mcplib_backend},
+        {"request", mcplib_request},
         {"attach", mcplib_attach},
         {NULL, NULL}
     };

@@ -93,7 +93,6 @@ end
 -- need to redefine main_zones using fetched selectors?
 
 -- TODO: Fallback zone here?
--- TODO: get rid of the local arg redefinitions.
 function failover_factory(zones, local_zone)
     local near_zone = zones[local_zone]
     local far_zones = {}
@@ -114,6 +113,34 @@ function failover_factory(zones, local_zone)
                 end
             end
         end
+        return res -- send result back to client
+    end
+end
+
+-- SET's to main zone, issues deletes to far zones.
+function setinvalidate_factory(zones, local_zone)
+    local near_zone = zones[local_zone]
+    local far_zones = {}
+    -- NOTE: could shuffle/sort to re-order zone retry order
+    -- or use 'next(far_zones, idx)' via a stored upvalue here
+    for k, v in pairs(zones) do
+        if k ~= local_zone then
+            far_zones[k] = v
+        end
+    end
+    local new_req = mcp.request
+    return function(r)
+        local res = near_zone(r)
+        if res:ok() == true then
+            -- create a new delete request
+            local dr = new_req("delete /testing/" .. r:key() .. "\r\n")
+            for _, zone in pairs(far_zones) do
+                -- NOTE: can check/do things on the specific response here.
+                zone(dr)
+            end
+        end
+        -- use original response for client, not DELETE's response.
+        -- else client won't understand.
         return res -- send result back to client
     end
 end
@@ -147,10 +174,9 @@ function command_factory(map, default)
 end
 
 -- TODO: is the return value the average? anything special?
+-- walks a list of selectors and repeats the request.
 function walkall_factory(pool)
     local p = {}
-    -- convert the pool into a list of servers.
-    -- TODO: __pairs can be used for selectors to recover their server objects.
     -- TODO: a shuffle could be useful here.
     for _, v in pairs(pool) do
         table.insert(p, v)
@@ -171,8 +197,9 @@ function mcp_config_routes(main_zones)
     for pfx, z in pairs(main_zones) do
         local failover = failover_factory(z, my_zone)
         local all = walkall_factory(main_zones[pfx])
+        local setdel = setinvalidate_factory(z, my_zone)
         local map = {}
-        map[mcp.CMD_SET] = all
+        map[mcp.CMD_SET] = setdel
         map[mcp.CMD_DELETE] = all
         prefixes[pfx] = command_factory(map, failover)
     end
