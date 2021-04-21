@@ -1789,24 +1789,62 @@ static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
             }
             break;
         case 3:
-            if (cm[0] == 'g' && cm[1] == 'e' && cm[2] == 't') {
-                cmd = CMD_GET;
+            if (cm[0] == 'g') {
+                if (cm[1] == 'e' && cm[2] == 't') {
+                    cmd = CMD_GET;
+                }
+                if (cm[1] == 'a' && cm[2] == 't') {
+                    cmd = CMD_GAT;
+                }
             } else if (cm[0] == 's' && cm[1] == 'e' && cm[2] == 't') {
                 cmd = CMD_SET;
                 ret = _process_request_storage(rq, cur, token);
             } else if (cm[0] == 'a' && cm[1] == 'd' && cm[2] == 'd') {
                 cmd = CMD_ADD;
                 ret = _process_request_storage(rq, cur, token);
+            } else if (cm[0] == 'c' && cm[1] == 'a' && cm[2] == 's') {
+                cmd = CMD_CAS;
+                ret = _process_request_storage(rq, cur, token);
+            }
+            break;
+        case 4:
+            if (cm[0] == 'g' && cm[1] == 'e' && cm[2] == 't' && cm[3] == 's') {
+                cmd = CMD_GETS;
+            } else if (cm[0] == 'i' && cm[1] == 'n' && cm[2] == 'c' && cm[3] == 'r') {
+                cmd = CMD_INCR;
+            } else if (cm[0] == 'd' && cm[1] == 'e' && cm[2] == 'c' && cm[3] == 'r') {
+                cmd = CMD_DECR;
+            }
+            break;
+        case 5:
+            if (strncmp(cm, "touch", 6) == 0) {
+                cmd = CMD_TOUCH;
             }
             break;
         case 6:
             if (strncmp(cm, "delete", 6) == 0) {
                 cmd = CMD_DELETE;
+            } else if (strncmp(cm, "append", 6) == 0) {
+                cmd = CMD_APPEND;
+                ret = _process_request_storage(rq, cur, token);
+            }
+            break;
+        case 7:
+            if (strncmp(cm, "replace", 7) == 0) {
+                cmd = CMD_REPLACE;
+                ret = _process_request_storage(rq, cur, token);
+            } else if (strncmp(cm, "prepend", 7) == 0) {
+                cmd = CMD_PREPEND;
+                ret = _process_request_storage(rq, cur, token);
             }
             break;
     }
 
     // TODO: check ret and fail if needed.
+    if (ret == -1) {
+
+    }
+    // TODO: check if cmd unfound? need special code?
 
     rq->command = cmd;
 }

@@ -30,19 +30,7 @@ my $p_srv = new_memcached('-o proxy_config=./t/startfile.lua');
 my $p_sock = $p_srv->sock;
 
 # cmds to test:
-# x set
-# x delete
-# x add
-# replace
-# append
-# prepend
-# cas
-# touch
-# gets
-# gat
-# incr
-# decr
-# - noreply?
+# - noreply for main text commands?
 # meta:
 # me
 # mn
