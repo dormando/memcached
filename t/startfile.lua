@@ -200,7 +200,13 @@ function mcp_config_routes(main_zones)
         local setdel = setinvalidate_factory(z, my_zone)
         local map = {}
         map[mcp.CMD_SET] = setdel
-        map[mcp.CMD_DELETE] = all
+        -- NOTE: in t/proxy.t all the backends point to the same place
+        -- which makes replicating delete return NOT_FOUND
+        map[mcp.CMD_DELETE] = failover_factory(z, my_zone)
+        -- similar with ADD. will get an NOT_STORED back.
+        -- need better routes designed for the test suite (edit the key
+        -- prefix or something)
+        map[mcp.CMD_ADD] = failover_factory(z, my_zone)
         prefixes[pfx] = command_factory(map, failover)
     end
 

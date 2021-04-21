@@ -29,10 +29,55 @@ my $sock = $srv->sock;
 my $p_srv = new_memcached('-o proxy_config=./t/startfile.lua');
 my $p_sock = $p_srv->sock;
 
+# cmds to test:
+# x set
+# x delete
+# x add
+# replace
+# append
+# prepend
+# cas
+# touch
+# gets
+# gat
+# incr
+# decr
+# - noreply?
+# meta:
+# me
+# mn
+# mg
+# ms
+# md
+# ma
+# - noreply?
+# stats
+# pass-thru?
+
 # set through proxy.
 {
     print $p_sock "set /foo/z 0 0 5\r\nhello\r\n";
     is(scalar <$p_sock>, "STORED\r\n", "stored test value through proxy");
+    # ensure it's fetchable.
+    mem_get_is($p_sock, "/foo/z", "hello");
+    # delete it.
+    print $p_sock "delete /foo/z\r\n";
+    is(scalar <$p_sock>, "DELETED\r\n", "removed test value");
+    # ensure it's deleted.
+    mem_get_is($p_sock, "/foo/z", undef);
+}
+
+# test add.
+{
+    print $p_sock "add /foo/a 0 0 3\r\nmoo\r\n";
+    is(scalar <$p_sock>, "STORED\r\n", "add test value through proxy");
+    # ensure it's fetchable
+    mem_get_is($p_sock, "/foo/a", "moo");
+    # check re-adding fails.
+    print $p_sock "add /foo/a 0 0 3\r\ngoo\r\n";
+    is(scalar <$p_sock>, "NOT_STORED\r\n", "re-add fails");
+    # ensure we still hae the old value
+    mem_get_is($p_sock, "/foo/a", "moo");
 }
 
 # pipelined set.

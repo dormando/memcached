@@ -1654,6 +1654,55 @@ static void proxy_register_defines(lua_State *L) {
 
 /*** REQUEST PARSER AND OBJECT ***/
 
+// FIXME: kill prints.
+static int _process_request_storage(mcp_request_t *rq, char *cur, int token) {
+    // see mcmc.c's _mcmc_parse_value_line() for the trick
+    // set <key> <flags> <exptime> <bytes> [noreply]\r\n
+    if (token != 2) {
+        fprintf(stderr, "ERROR\n");
+        return -1;
+    }
+    errno = 0;
+    char *n = NULL;
+    uint32_t flags = strtoul(cur, &n, 10);
+    if ((errno == ERANGE) || (cur == n) || (*n != ' ')) {
+        fprintf(stderr, "ERROR PARSING REQUEST\n");
+        return -1;
+    }
+    cur = n;
+
+    errno = 0;
+    int exptime = strtol(cur, &n, 10);
+    if ((errno == ERANGE) || (cur == n) || (*n != ' ')) {
+        fprintf(stderr, "ERROR PARSING REQUEST\n");
+        return -1;
+    }
+    cur = n;
+
+    errno = 0;
+    int vlen = strtol(cur, &n, 10);
+    if ((errno == ERANGE) || (cur == n)) {
+        fprintf(stderr, "ERROR PARSING REQUEST\n");
+        return -1;
+    }
+    cur = n;
+
+    if (vlen < 0 || vlen > (INT_MAX - 2)) {
+       fprintf(stderr, "ERROR PARSING REQUEST\n");
+       return -1;
+    }
+    vlen += 2;
+
+    // TODO: if *n is ' ' look for a CAS value.
+
+    rq->flags = flags;
+    rq->exptime = exptime;
+    rq->vlen = vlen;
+    // TODO: if next byte has a space, we check for noreply.
+    // TODO: ensure last character is \r
+    return 0;
+}
+
 // FIXME: tokenize_command strlen's the command... why?
 // because multigets require it to parcel it up?
 // length == 0 but value != NULL means parse more from VALUE.
@@ -1705,6 +1754,7 @@ static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
     char *cm = rq->tokens[COMMAND_TOKEN].value;
     size_t cl = rq->tokens[COMMAND_TOKEN].length;
     int cmd = -1;
+    int ret = 0;
 
     switch (cl) {
         case 0:
@@ -1742,49 +1792,11 @@ static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
             if (cm[0] == 'g' && cm[1] == 'e' && cm[2] == 't') {
                 cmd = CMD_GET;
             } else if (cm[0] == 's' && cm[1] == 'e' && cm[2] == 't') {
-                // see mcmc.c's _mcmc_parse_value_line() for the trick
-                // set <key> <flags> <exptime> <bytes> [noreply]\r\n
                 cmd = CMD_SET;
-                if (token != 2) {
-                    fprintf(stderr, "ERROR\n");
-                    return;
-                }
-                errno = 0;
-                char *n = NULL;
-                uint32_t flags = strtoul(cur, &n, 10);
-                if ((errno == ERANGE) || (cur == n) || (*n != ' ')) {
-                    fprintf(stderr, "ERROR PARSING REQUEST\n");
-                    return;
-                }
-                cur = n;
-
-                errno = 0;
-                int exptime = strtol(cur, &n, 10);
-                if ((errno == ERANGE) || (cur == n) || (*n != ' ')) {
-                    fprintf(stderr, "ERROR PARSING REQUEST\n");
-                    return;
-                }
-                cur = n;
-
-                errno = 0;
-                int vlen = strtol(cur, &n, 10);
-                if ((errno == ERANGE) || (cur == n)) {
-                    fprintf(stderr, "ERROR PARSING REQUEST\n");
-                    return;
-                }
-                cur = n;
-
-                if (vlen < 0 || vlen > (INT_MAX - 2)) {
-                   fprintf(stderr, "ERROR\n");
-                   return;
-                }
-                vlen += 2;
-
-                rq->flags = flags;
-                rq->exptime = exptime;
-                rq->vlen = vlen;
-                // TODO: if next byte has a space, we check for noreply.
-                // TODO: ensure last character is \r
+                ret = _process_request_storage(rq, cur, token);
+            } else if (cm[0] == 'a' && cm[1] == 'd' && cm[2] == 'd') {
+                cmd = CMD_ADD;
+                ret = _process_request_storage(rq, cur, token);
             }
             break;
         case 6:
@@ -1793,6 +1805,8 @@ static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
             }
             break;
     }
+
+    // TODO: check ret and fail if needed.
 
     rq->command = cmd;
 }
