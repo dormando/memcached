@@ -35,8 +35,8 @@
 #define MCP_THREAD_UPVALUE 1
 #define MCP_ATTACH_UPVALUE 2
 
-// TODO: move to config option.
-#define PROXY_EVENT_IO_THREADS 4
+// NOTE: unused right now.
+//#define PROXY_EVENT_IO_THREADS 4
 
 typedef uint32_t (*hash_selector_func)(const void *key, size_t len);
 typedef struct {
@@ -323,8 +323,8 @@ static void proxy_event_handler(evutil_socket_t fd, short which, void *arg) {
 // TODO: this is unused while other parts of the code are fleshed out.
 // debugged a few race conditions, and as-is it ended up being slower in quick
 // tests than running the syscalls inline with the event thread.
-// If code is truly stable without this I will revisit it later.
-static void *proxy_event_io_thread(void *arg) {
+// If code is truly stable I will revisit it later.
+/*static void *proxy_event_io_thread(void *arg) {
     proxy_event_io_thread_t *t = arg;
     while (1) {
         bool signal = false;
@@ -368,13 +368,13 @@ static void *proxy_event_io_thread(void *arg) {
     }
 
     return NULL;
-}
+}*/
 
 static void *proxy_event_thread(void *arg) {
     proxy_event_thread_t *t = arg;
 
     // create our dedicated backend threads for syscall fanout.
-    t->bt = calloc(PROXY_EVENT_IO_THREADS, sizeof(proxy_event_io_thread_t));
+    /*t->bt = calloc(PROXY_EVENT_IO_THREADS, sizeof(proxy_event_io_thread_t));
     assert(t->bt != NULL); // TODO: unlikely malloc error.
     for (int x = 0;x < PROXY_EVENT_IO_THREADS; x++) {
         proxy_event_io_thread_t *bt = &t->bt[x];
@@ -383,7 +383,7 @@ static void *proxy_event_thread(void *arg) {
         pthread_cond_init(&bt->cond, NULL);
 
         pthread_create(&bt->thread_id, NULL, proxy_event_io_thread, bt);
-    }
+    }*/
 
     event_base_loop(t->base, 0);
     event_base_free(t->base);
