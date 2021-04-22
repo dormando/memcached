@@ -56,15 +56,9 @@ enum mcp_backend_states {
 };
 
 typedef struct mcp_backend_s mcp_backend_t;
-// TODO: tokens, request/etc, aren't safe when used by lua. we need to copy
-// the string in after an allocation and __gc it later (or remove it early?)
-// for the C API these could just point into c->rbuf and be a fast path.
-// for lua it could work if we enforce request objects to be destroyed when
-// their original coroutine is killed.
-// the request object could be "marked" as invalid at the same time as
-// resetthread is called.
-// need to confirm that c->rbuf is safe to use the whole time as well.
-// FIXME: until __gc is added rq->buf will leak.
+// TODO: need to confirm that c->rbuf is safe to use the whole time.
+// - I forgot what this was already? need to re-check. have addressed other
+// prior comments already.
 #define MAX_REQ_TOKENS 2
 typedef struct {
     mcp_backend_t *be; // backend handling this request.
@@ -81,7 +75,6 @@ typedef struct {
     void *buf; // temporary buffer for SET/payload requests.
 } mcp_request_t;
 
-// TODO: array of clients based on connection limit.
 typedef STAILQ_HEAD(io_head_s, _io_pending_proxy_t) io_head_t;
 #define MAX_IPLEN 45
 #define MAX_PORTLEN 6
@@ -175,11 +168,14 @@ static void dump_stack(lua_State *L);
 static void mcp_queue_io(conn *c, mc_resp *resp, int coro_ref, lua_State *Lc);
 static mcp_request_t *mcp_new_request(lua_State *L, const char *command, size_t cmdlen);
 static void proxy_backend_handler(const int fd, const short which, void *arg);
+static void proxy_event_handler(evutil_socket_t fd, short which, void *arg);
+static void *proxy_event_thread(void *arg);
 static void proxy_out_errstring(mc_resp *resp, const char *str);
 static int _flush_pending_write(mcp_backend_t *be, io_pending_proxy_t *p);
 static void _set_event(mcp_backend_t *be, struct event_base *base, int flags, struct timeval t);
 
-// -------------- EXTERNAL FUNCTIONS
+/******** EXTERNAL FUNCTIONS ******/
+// functions starting with _ are breakouts for the public functions.
 
 struct _dumpbuf {
     size_t size;
@@ -213,184 +209,6 @@ static const char * _load_helper(lua_State *L, void *data, size_t *size) {
     *size = db->used;
     db->used = 0;
     return db->buf;
-}
-
-// handler for adding requests to a server's queue.
-// FIXME: is this going to get mass fired even though we're batching here?
-// FIXME: rename to proxy_evthread_handler ?
-static void proxy_event_handler(evutil_socket_t fd, short which, void *arg) {
-    proxy_event_thread_t *t = arg;
-    io_head_t head;
-
-    char buf[1];
-    // TODO: This is a lot more fatal than it should be. can it fail? can
-    // it blow up the server?
-    if (read(fd, buf, 1) != 1) {
-        P_DEBUG("%s: pipe read failed\n", __func__);
-        return;
-    }
-
-    STAILQ_INIT(&head);
-    STAILQ_INIT(&t->be_head);
-
-    // Pull the entire stack of inbound into local queue.
-    pthread_mutex_lock(&t->mutex);
-    STAILQ_CONCAT(&head, &t->io_head_in);
-    pthread_mutex_unlock(&t->mutex);
-
-    int io_count = 0;
-    int be_count = 0;
-    while (!STAILQ_EMPTY(&head)) {
-        io_pending_proxy_t *io = STAILQ_FIRST(&head);
-        io->flushed = false;
-        mcp_backend_t *be = io->backend;
-        // So the backend can retrieve its event base.
-        be->event_thread = t;
-
-        // _no_ mutex on backends. they are owned by the event thread.
-        STAILQ_REMOVE_HEAD(&head, io_next);
-        STAILQ_INSERT_TAIL(&be->io_head, io, io_next);
-        be->depth++;
-        io_count++;
-        if (!be->stacked) {
-            be->stacked = true;
-            STAILQ_INSERT_TAIL(&t->be_head, be, be_next);
-            be_count++;
-        }
-    }
-
-    if (io_count == 0) {
-        //P_DEBUG("%s: no IO's to complete\n", __func__);
-        return;
-    }
-    //P_DEBUG("%s: io/be counts for syscalls [%d/%d]\n", __func__, io_count, be_count);
-
-    /*
-    // TODO: see notes on proxy_event_io_thread
-    pthread_mutex_lock(&t->mutex);
-    // initialize iterator.
-    t->iter = STAILQ_FIRST(&t->be_head);
-    // FIXME: this loop is only correct if all io threads are definitely
-    // waiting before we lock the ev mutex.
-    // need to confirm if we have to lock the bt->mutex's first for sure.
-
-    // TODO: if IO count is low, run in-line.
-    // IO requests are now stacked into per-backend queues.
-    // we do this here to avoid needing mutexes on backends.
-    for (int x = 0; x < PROXY_EVENT_IO_THREADS; x++) {
-        proxy_event_io_thread_t *bt = &t->bt[x];
-        pthread_mutex_lock(&bt->mutex);
-        pthread_cond_signal(&bt->cond);
-        pthread_mutex_unlock(&bt->mutex);
-        if (x == be_count-1)
-            break;
-    }
-
-    // TODO: could speculatively run the event_add's all here while the
-    // threads run.
-
-    // wait for bg threads while iterator is still valid.
-    pthread_cond_wait(&t->cond, &t->mutex);
-    pthread_mutex_unlock(&t->mutex);
-    */
-
-    // Re-walk each backend and check set event as required.
-    mcp_backend_t *be = NULL;
-    struct timeval tmp_time = {5,0}; // FIXME: temporary hard coded timeout.
-
-    // FIXME: _set_event() is buggy, see notes on function.
-    STAILQ_FOREACH(be, &t->be_head, be_next) {
-        be->stacked = false;
-        if (be->connecting) {
-            P_DEBUG("%s: deferring IO pending connecting\n", __func__);
-        } else {
-            io_pending_proxy_t *io = NULL;
-            int flags = 0;
-            STAILQ_FOREACH(io, &be->io_head, io_next) {
-                flags |= _flush_pending_write(be, io);
-                if (flags & EV_WRITE) {
-                    break;
-                }
-            }
-
-        }
-        int flags = be->can_write ? EV_READ|EV_TIMEOUT : EV_READ|EV_WRITE|EV_TIMEOUT;
-        _set_event(be, t->base, flags, tmp_time);
-    }
-
-}
-
-// TODO: this is unused while other parts of the code are fleshed out.
-// debugged a few race conditions, and as-is it ended up being slower in quick
-// tests than running the syscalls inline with the event thread.
-// If code is truly stable I will revisit it later.
-/*static void *proxy_event_io_thread(void *arg) {
-    proxy_event_io_thread_t *t = arg;
-    while (1) {
-        bool signal = false;
-        proxy_event_thread_t *ev = t->ev;
-        pthread_mutex_lock(&ev->mutex);
-        if (ev->iter == NULL) {
-            pthread_mutex_lock(&t->mutex);
-            pthread_mutex_unlock(&ev->mutex);
-
-            pthread_cond_wait(&t->cond, &t->mutex);
-            pthread_mutex_unlock(&t->mutex);
-            continue;
-        }
-
-        // Get a backend to process.
-        mcp_backend_t *be = ev->iter;
-        // bump the iterator for the next thread.
-        ev->iter = STAILQ_NEXT(be, be_next);
-        if (ev->iter == NULL)
-            signal = true;
-        pthread_mutex_unlock(&ev->mutex);
-
-        // If we're in a connecting state, simply skip the flush here and let
-        // the event thread wait for a write event.
-        if (be->connecting) {
-            P_DEBUG("%s: deferring IO pending connecting\n", __func__);
-        } else {
-            // FIXME: move to a function so we can call this from
-            // proxy_backend_handler.
-            io_pending_proxy_t *io = NULL;
-            int flags = 0;
-            STAILQ_FOREACH(io, &be->io_head, io_next) {
-                flags |= _flush_pending_write(be, io);
-                if (flags & EV_WRITE) {
-                    break;
-                }
-            }
-        }
-        if (signal)
-            pthread_cond_signal(&ev->cond);
-    }
-
-    return NULL;
-}*/
-
-static void *proxy_event_thread(void *arg) {
-    proxy_event_thread_t *t = arg;
-
-    // create our dedicated backend threads for syscall fanout.
-    /*t->bt = calloc(PROXY_EVENT_IO_THREADS, sizeof(proxy_event_io_thread_t));
-    assert(t->bt != NULL); // TODO: unlikely malloc error.
-    for (int x = 0;x < PROXY_EVENT_IO_THREADS; x++) {
-        proxy_event_io_thread_t *bt = &t->bt[x];
-        bt->ev = t;
-        pthread_mutex_init(&bt->mutex, NULL);
-        pthread_cond_init(&bt->cond, NULL);
-
-        pthread_create(&bt->thread_id, NULL, proxy_event_io_thread, bt);
-    }*/
-
-    event_base_loop(t->base, 0);
-    event_base_free(t->base);
-
-    // TODO: join bt threads, free array.
-
-    return NULL;
 }
 
 // start the centralized lua state and config thread.
@@ -798,7 +616,186 @@ void complete_nread_proxy(conn *c) {
     return;
 }
 
-/******** END PUBLIC COMMANDS ******/
+/******** NETWORKING AND INTERNAL FUNCTIONS ******/
+
+// handler for adding requests to a server's queue.
+// FIXME: is this going to get mass fired even though we're batching here?
+// FIXME: rename to proxy_evthread_handler ?
+static void proxy_event_handler(evutil_socket_t fd, short which, void *arg) {
+    proxy_event_thread_t *t = arg;
+    io_head_t head;
+
+    char buf[1];
+    // TODO: This is a lot more fatal than it should be. can it fail? can
+    // it blow up the server?
+    if (read(fd, buf, 1) != 1) {
+        P_DEBUG("%s: pipe read failed\n", __func__);
+        return;
+    }
+
+    STAILQ_INIT(&head);
+    STAILQ_INIT(&t->be_head);
+
+    // Pull the entire stack of inbound into local queue.
+    pthread_mutex_lock(&t->mutex);
+    STAILQ_CONCAT(&head, &t->io_head_in);
+    pthread_mutex_unlock(&t->mutex);
+
+    int io_count = 0;
+    int be_count = 0;
+    while (!STAILQ_EMPTY(&head)) {
+        io_pending_proxy_t *io = STAILQ_FIRST(&head);
+        io->flushed = false;
+        mcp_backend_t *be = io->backend;
+        // So the backend can retrieve its event base.
+        be->event_thread = t;
+
+        // _no_ mutex on backends. they are owned by the event thread.
+        STAILQ_REMOVE_HEAD(&head, io_next);
+        STAILQ_INSERT_TAIL(&be->io_head, io, io_next);
+        be->depth++;
+        io_count++;
+        if (!be->stacked) {
+            be->stacked = true;
+            STAILQ_INSERT_TAIL(&t->be_head, be, be_next);
+            be_count++;
+        }
+    }
+
+    if (io_count == 0) {
+        //P_DEBUG("%s: no IO's to complete\n", __func__);
+        return;
+    }
+    //P_DEBUG("%s: io/be counts for syscalls [%d/%d]\n", __func__, io_count, be_count);
+
+    /*
+    // TODO: see notes on proxy_event_io_thread
+    pthread_mutex_lock(&t->mutex);
+    // initialize iterator.
+    t->iter = STAILQ_FIRST(&t->be_head);
+    // FIXME: this loop is only correct if all io threads are definitely
+    // waiting before we lock the ev mutex.
+    // need to confirm if we have to lock the bt->mutex's first for sure.
+
+    // TODO: if IO count is low, run in-line.
+    // IO requests are now stacked into per-backend queues.
+    // we do this here to avoid needing mutexes on backends.
+    for (int x = 0; x < PROXY_EVENT_IO_THREADS; x++) {
+        proxy_event_io_thread_t *bt = &t->bt[x];
+        pthread_mutex_lock(&bt->mutex);
+        pthread_cond_signal(&bt->cond);
+        pthread_mutex_unlock(&bt->mutex);
+        if (x == be_count-1)
+            break;
+    }
+
+    // TODO: could speculatively run the event_add's all here while the
+    // threads run.
+
+    // wait for bg threads while iterator is still valid.
+    pthread_cond_wait(&t->cond, &t->mutex);
+    pthread_mutex_unlock(&t->mutex);
+    */
+
+    // Re-walk each backend and check set event as required.
+    mcp_backend_t *be = NULL;
+    struct timeval tmp_time = {5,0}; // FIXME: temporary hard coded timeout.
+
+    // FIXME: _set_event() is buggy, see notes on function.
+    STAILQ_FOREACH(be, &t->be_head, be_next) {
+        be->stacked = false;
+        if (be->connecting) {
+            P_DEBUG("%s: deferring IO pending connecting\n", __func__);
+        } else {
+            io_pending_proxy_t *io = NULL;
+            int flags = 0;
+            STAILQ_FOREACH(io, &be->io_head, io_next) {
+                flags |= _flush_pending_write(be, io);
+                if (flags & EV_WRITE) {
+                    break;
+                }
+            }
+
+        }
+        int flags = be->can_write ? EV_READ|EV_TIMEOUT : EV_READ|EV_WRITE|EV_TIMEOUT;
+        _set_event(be, t->base, flags, tmp_time);
+    }
+
+}
+
+// TODO: this is unused while other parts of the code are fleshed out.
+// debugged a few race conditions, and as-is it ended up being slower in quick
+// tests than running the syscalls inline with the event thread.
+// If code is truly stable I will revisit it later.
+/*static void *proxy_event_io_thread(void *arg) {
+    proxy_event_io_thread_t *t = arg;
+    while (1) {
+        bool signal = false;
+        proxy_event_thread_t *ev = t->ev;
+        pthread_mutex_lock(&ev->mutex);
+        if (ev->iter == NULL) {
+            pthread_mutex_lock(&t->mutex);
+            pthread_mutex_unlock(&ev->mutex);
+
+            pthread_cond_wait(&t->cond, &t->mutex);
+            pthread_mutex_unlock(&t->mutex);
+            continue;
+        }
+
+        // Get a backend to process.
+        mcp_backend_t *be = ev->iter;
+        // bump the iterator for the next thread.
+        ev->iter = STAILQ_NEXT(be, be_next);
+        if (ev->iter == NULL)
+            signal = true;
+        pthread_mutex_unlock(&ev->mutex);
+
+        // If we're in a connecting state, simply skip the flush here and let
+        // the event thread wait for a write event.
+        if (be->connecting) {
+            P_DEBUG("%s: deferring IO pending connecting\n", __func__);
+        } else {
+            // FIXME: move to a function so we can call this from
+            // proxy_backend_handler.
+            io_pending_proxy_t *io = NULL;
+            int flags = 0;
+            STAILQ_FOREACH(io, &be->io_head, io_next) {
+                flags |= _flush_pending_write(be, io);
+                if (flags & EV_WRITE) {
+                    break;
+                }
+            }
+        }
+        if (signal)
+            pthread_cond_signal(&ev->cond);
+    }
+
+    return NULL;
+}*/
+
+static void *proxy_event_thread(void *arg) {
+    proxy_event_thread_t *t = arg;
+
+    // create our dedicated backend threads for syscall fanout.
+    /*t->bt = calloc(PROXY_EVENT_IO_THREADS, sizeof(proxy_event_io_thread_t));
+    assert(t->bt != NULL); // TODO: unlikely malloc error.
+    for (int x = 0;x < PROXY_EVENT_IO_THREADS; x++) {
+        proxy_event_io_thread_t *bt = &t->bt[x];
+        bt->ev = t;
+        pthread_mutex_init(&bt->mutex, NULL);
+        pthread_cond_init(&bt->cond, NULL);
+
+        pthread_create(&bt->thread_id, NULL, proxy_event_io_thread, bt);
+    }*/
+
+    event_base_loop(t->base, 0);
+    event_base_free(t->base);
+
+    // TODO: join bt threads, free array.
+
+    return NULL;
+}
+
 
 // Need a custom function so we can prefix lua strings easily.
 // TODO: can this be made not-necessary somehow?
@@ -1402,6 +1399,8 @@ static void mcp_queue_io(conn *c, mc_resp *resp, int coro_ref, lua_State *Lc) {
 
     return;
 }
+
+/******** LUA INTERFACE FUNCTIONS ******/
 
 __attribute__((unused)) static void dump_stack(lua_State *L) {
     int top = lua_gettop(L);
