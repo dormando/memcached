@@ -881,13 +881,21 @@ static int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t 
                 resp->write_and_free = r->buf;
                 resp_add_iov(resp, r->buf, r->blen);
                 r->buf = NULL;
-            } else if (lua_getiuservalue(Lc, -1, 1) != LUA_TNONE) {
-                // response set into lua via an internal.
+            } else if (lua_getiuservalue(Lc, -1, 1) != LUA_TNIL) {
+                // uservalue slot 1 is pre-created, so we get TNIL instead of
+                // TNONE when nothing was set into it.
                 const char *s = lua_tolstring(Lc, -1, &rlen);
                 size_t l = rlen > WRITE_BUFFER_SIZE ? WRITE_BUFFER_SIZE : rlen;
                 memcpy(resp->wbuf, s, l);
                 resp_add_iov(resp, resp->wbuf, l);
                 lua_pop(Lc, 1);
+            } else if (r->status != MCMC_OK) {
+                proxy_out_errstring(resp, "backend failure");
+            } else {
+                // TODO: double check how this can get here?
+                // MCMC_OK but no buffer and no internal value set? still an
+                // error?
+                P_DEBUG("%s: unhandled response\n", __func__);
             }
         } else if (type == LUA_TSTRING) {
             // response is a raw string from lua.
@@ -926,12 +934,9 @@ static int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t 
         // TODO: c only used for cache alloc? push the above into the func?
         mcp_queue_io(c, resp, coro_ref, Lc);
     } else {
-        // error?
-        fprintf(stderr, "CFailed to run coroutine: %s\n", lua_tostring(Lc, -1));
-        // TODO: send generic ERROR and stop here. Also I know the length
-        // is wrong :)
-        memcpy(resp->wbuf, "SERVER_ERROR lua failure\r\n", 27);
-        resp_add_iov(resp, resp->wbuf, 27);
+        // TODO: log entry for the full failure.
+        P_DEBUG("%s: Failed to run coroutine: %s\n", __func__, lua_tostring(Lc, -1));
+        proxy_out_errstring(resp, "lua failure");
     }
 
     return 0;
@@ -1320,11 +1325,11 @@ static void proxy_backend_handler(const int fd, const short which, void *arg) {
             int err = 0;
             // We were connecting, now ensure we're properly connected.
             if (mcmc_check_nonblock_connect(be->client, &err) != MCMC_OK) {
-                // TODO: for now we kill the stack. need to retry a few times
-                // first.
-                // TODO: will need a mechanism for max retries, waits between
-                // fast-fails, and failing the stack equivalent to a timeout.
-                assert(1 == 0);
+                // kick the bad backend, clear the queue, retry later.
+                // FIXME: if a connect fails, anything currently in the queue
+                // should be safe to hold up until their timeout.
+                _reset_bad_backend(be);
+                return;
             }
             be->connecting = false;
             be->state = mcp_backend_read;
