@@ -210,12 +210,21 @@ function mcp_config_routes(main_zones)
         prefixes[pfx] = command_factory(map, failover)
     end
 
-    -- TODO: could also wrap routetop with a final failover:
-    -- modify the exptime for sets.
     local routetop = prefix_factory("^/(%a+)/", prefixes, function(r) return "SERVER_ERROR no route\r\n" end)
+
+    -- TODO: we will have a way of handling these internally.
+    local top_map = {}
+    top_map[mcp.CMD_VERSION] = function(r)
+        return "VERSION 1.6.9\r\n"
+    end
+
+    top_map[mcp.CMD_STATS] = function(r)
+        return "STAT na 0\r\nEND\r\n"
+    end
+
     -- internally run parser at top of tree
     -- also wrap the request string with a convenience object until the C bits
     -- are attached to the internal parser.
-    --mcp.attach(mcp.REQUEST_ANY, function (r) return routetop(Request:new(r)) end)
-    mcp.attach(mcp.CMD_ANY, function (r) return routetop(r) end)
+    --mcp.attach(mcp.CMD_ANY, function (r) return routetop(r) end)
+    mcp.attach(mcp.CMD_ANY, command_factory(top_map, routetop))
 end

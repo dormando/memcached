@@ -152,10 +152,17 @@ struct _io_pending_proxy_t {
 // also, 64bit? 32bit? either?
 // TODO: hash selectors should hash to a list of "Things"
 // things can be anything callable: lua funcs, hash selectors, backends.
+// TODO: does *be have to be a sub-struct? how stable are userdata pointers?
+// https://stackoverflow.com/questions/38718475/lifetime-of-lua-userdata-pointers
+// - says no.
 typedef struct {
     int ref; // luaL_ref reference.
     mcp_backend_t *be;
 } mcp_hash_selector_be_t;
+
+// TODO: hash/compare func ptr
+// void *ctx
+// ctx_ref?
 typedef struct {
     hash_selector_func func;
     int pool_size;
@@ -1921,8 +1928,11 @@ static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
             }
             break;
         case 5:
-            if (strncmp(cm, "touch", 6) == 0) {
+            if (strncmp(cm, "touch", 5) == 0) {
                 cmd = CMD_TOUCH;
+            } else if (strncmp(cm, "stats", 5) == 0) {
+                cmd = CMD_STATS;
+                // :key() should give the stats sub-command?
             }
             break;
         case 6:
@@ -1940,6 +1950,8 @@ static void process_request(mcp_request_t *rq, char *command, size_t cmdlen) {
             } else if (strncmp(cm, "prepend", 7) == 0) {
                 cmd = CMD_PREPEND;
                 ret = _process_request_storage(rq, cur, token);
+            } else if (strncmp(cm, "version", 7) == 0) {
+                cmd = CMD_VERSION;
             }
             break;
     }
