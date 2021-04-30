@@ -9,7 +9,6 @@
 local my_zone = 'z1'
 
 function mcp_config_selectors(oldss)
-
     -- alias mcp.backend for convenience.
     -- important to alias global variables in routes where speed is concerned.
     local srv = mcp.backend
@@ -77,13 +76,21 @@ function mcp_config_selectors(oldss)
     -- FIXME: should we copy the table to keep the pool tables around?
     -- does the hash selector hold a reference to the pool (but only available in main config?)
 
+    -- uncomment to use the ketama loadable module.
+    -- FIXME: passing an argument to the ketama module doesn't work yet.
+    -- local ketama = require("ketama")
+
     -- convert the pools into hash selectors.
     -- TODO: is this a good place to add prefixing/hash editing?
     for _, subs in pairs(main_zones) do
         for k, v in pairs(subs) do
-            subs[k] = mcp.hash_selector(mcp.hash_murmur3, v)
+            -- switch the next two lines if you want to test the ketama
+            -- loadable module.
+            --subs[k] = mcp.hash_selector(v, ketama)
+            subs[k] = mcp.hash_selector(v)
         end
     end
+
 
     return main_zones
 end

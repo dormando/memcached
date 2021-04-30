@@ -38,12 +38,17 @@
 // NOTE: unused right now.
 //#define PROXY_EVENT_IO_THREADS 4
 
-typedef uint32_t (*hash_selector_func)(const void *key, size_t len);
-typedef struct {
-    hash_selector_func func;
-} mcp_hashfunc_t;
+typedef uint32_t (*hash_selector_func)(const void *key, size_t len, void *ctx);
+struct proxy_hash_caller {
+    hash_selector_func selector_func;
+    void *ctx;
+};
 
-static mcp_hashfunc_t mcplib_hashfunc_murmur3 = { MurmurHash3_x86_32 };
+// A default hash function for backends.
+static uint32_t mcplib_hashfunc_murmur3_func(const void *key, size_t len, void *ctx) {
+    return MurmurHash3_x86_32(key, len);
+}
+static struct proxy_hash_caller mcplib_hashfunc_murmur3 = { mcplib_hashfunc_murmur3_func, NULL};
 
 typedef struct _io_pending_proxy_t io_pending_proxy_t;
 typedef struct proxy_event_thread_s proxy_event_thread_t;
@@ -164,7 +169,8 @@ typedef struct {
 // void *ctx
 // ctx_ref?
 typedef struct {
-    hash_selector_func func;
+    struct proxy_hash_caller *phc;
+    int phc_ref;
     int pool_size;
     mcp_hash_selector_be_t pool[];
 } mcp_hash_selector_t;
@@ -295,7 +301,7 @@ void proxy_init(void) {
     // now we complete the data load by calling the function.
     res = lua_pcall(L, 0, LUA_MULTRET, 0);
     if (res != LUA_OK) {
-        fprintf(stderr, "Failed to load data into L\n");
+        fprintf(stderr, "Failed to load data into L: %s\n", lua_tostring(L, -1));
         exit(EXIT_FAILURE);
     }
 
@@ -1620,18 +1626,17 @@ static int mcplib_backend(lua_State *L) {
     return 1;
 }
 
-// ss = mcp.hash_selector(hashfunc, pool)
+// hs = mcp.hash_selector(pool, hashfunc, [option])
 static int mcplib_hash_selector(lua_State *L) {
-    // TODO: need some hash funcs.
-    luaL_checktype(L, -2, LUA_TLIGHTUSERDATA);
-    luaL_checktype(L, -1, LUA_TTABLE);
-    int n = luaL_len(L, -1); // get length of array table
+    int argc = lua_gettop(L);
+    luaL_checktype(L, 1, LUA_TTABLE);
+    int n = luaL_len(L, 1); // get length of array table
 
-    // TODO: this'll have to change to a pointer, since that pointer will get
-    // shuffled off somewhere else.
-    mcp_hash_selector_t *ss = lua_newuserdatauv(L, sizeof(mcp_hash_selector_t) + sizeof(mcp_hash_selector_be_t) * n, 0);
-    // TODO: check ss.
-    ss->pool_size = n;
+    mcp_hash_selector_t *hs = lua_newuserdatauv(L, sizeof(mcp_hash_selector_t) + sizeof(mcp_hash_selector_be_t) * n, 0);
+    // TODO: check hs.
+    // FIXME: zero the memory? then __gc will fix up server references on
+    // errors.
+    hs->pool_size = n;
 
     luaL_setmetatable(L, "mcp.hash_selector");
 
@@ -1640,8 +1645,8 @@ static int mcplib_hash_selector(lua_State *L) {
     // TODO: we need a second array with luaL_ref()'s to each of the servers.
     // or an array of structs which hold ptr's.
     for (int x = 1; x <= n; x++) {
-        mcp_hash_selector_be_t *s = &ss->pool[x-1];
-        lua_geti(L, -2, x); // get next server into the stack.
+        mcp_hash_selector_be_t *s = &hs->pool[x-1];
+        lua_geti(L, 1, x); // get next server into the stack.
         // TODO: do we leak memory if we bail here?
         // the stack should clear, then release the userdata + etc?
         // - yes it should leak memory for the registry indexed items.
@@ -1649,10 +1654,66 @@ static int mcplib_hash_selector(lua_State *L) {
         s->ref = luaL_ref(L, LUA_REGISTRYINDEX); // references and pops object.
     }
 
-    mcp_hashfunc_t *hf = lua_touserdata(L, -3);
-    ss->func = hf->func;
+    if (argc > 1) {
+        luaL_checktype(L, 2, LUA_TTABLE);
+        if (lua_getfield(L, 2, "new") != LUA_TFUNCTION) {
+            proxy_lua_error(L, "hash selector missing 'new' function");
+            return 0;
+        }
 
-    //printf("created new hash selector\n");
+        // - if argc > 2 we have an option
+        if (argc > 2) {
+            // - move the function to before optional arguments
+            lua_insert(L, 2); // moves -1 to position N
+            //   - stack should be: pool, hash, func, optN
+        }
+
+        // - now create the copy pool table
+        lua_createtable(L, hs->pool_size, 0); // give the new pool table a sizing hint.
+        for (int x = 1; x <= hs->pool_size; x++) {
+            mcp_backend_t *be = hs->pool[x-1].be;
+            lua_createtable(L, 0, 4);
+            // stack = [p, h, f, optN, newpool, backend]
+            // the key should be fine for id? maybe don't need to duplicate
+            // this?
+            lua_pushinteger(L, x);
+            lua_setfield(L, -2, "id");
+            // TODO: need to get hostname (Separate from logical name?)
+            // into the backend objects somehow.
+            lua_pushstring(L, "unknown");
+            lua_setfield(L, -2, "thing");
+            lua_pushstring(L, be->ip);
+            lua_setfield(L, -2, "addr");
+            lua_pushstring(L, be->port);
+            lua_setfield(L, -2, "port");
+            // TODO: weight/etc?
+
+            // set the backend table into the new pool table.
+            lua_rawseti(L, -2, x);
+        }
+
+        // call the hash init function.
+        // FIXME: if optarg 1 is + argc-2?
+        int res = lua_pcall(L, 1, 2, 0);
+
+        if (res != LUA_OK) {
+            lua_error(L); // error should be on the stack already.
+            return 0;
+        }
+
+        // TODO: validate response arguments.
+        // -1 is lightuserdata ptr to the struct (which must be owned by the
+        // userdata), which is later used for internal calls.
+        hs->phc = lua_touserdata(L, -1);
+        lua_pop(L, 1);
+        // -2 was userdata we need to hold a reference to.
+        hs->phc_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        // UD now popped from stack.
+    } else {
+        // Use default hash selector if none given.
+        hs->phc = &mcplib_hashfunc_murmur3;
+    }
+
     return 1;
 }
 
@@ -1668,11 +1729,21 @@ static int mcplib_hash_selector_call(lua_State *L) {
     // FIXME: indicator for if request actually has a key token or not.
     char *key = rq->tokens[KEY_TOKEN].value;
     size_t len = rq->tokens[KEY_TOKEN].length;
-    uint32_t hash = ss->func(key, len);
+    uint32_t lookup = ss->phc->selector_func(key, len, ss->phc->ctx);
 
     // attach the backend to the request object.
     // save CPU cycles over rolling it through lua.
-    rq->be = ss->pool[hash % ss->pool_size].be;
+    if (ss->phc->ctx == NULL) {
+        // TODO: if NULL, pass in pool_size as ctx?
+        // works because the % bit will return an id we can index here.
+        // FIXME: temporary? maybe?
+        // if no context, what we got back was a hash which we need to modulus
+        // against the pool, since the func has no info about the pool.
+        rq->be = ss->pool[lookup % ss->pool_size].be;
+    } else {
+        // else we have a direct id into our pool.
+        rq->be = ss->pool[lookup].be;
+    }
 
     // now yield request, hash selector up.
     return lua_yield(L, 2);
