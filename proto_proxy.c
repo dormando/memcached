@@ -1742,7 +1742,10 @@ static int mcplib_hash_selector_call(lua_State *L) {
         rq->be = ss->pool[lookup % ss->pool_size].be;
     } else {
         // else we have a direct id into our pool.
-        rq->be = ss->pool[lookup].be;
+        // the lua modules should "think" in 1 based indexes, so we need to
+        // subtract one here.
+        // TODO: bother validating the range?
+        rq->be = ss->pool[lookup-1].be;
     }
 
     // now yield request, hash selector up.
