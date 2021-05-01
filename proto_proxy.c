@@ -1661,13 +1661,6 @@ static int mcplib_hash_selector(lua_State *L) {
             return 0;
         }
 
-        // - if argc > 2 we have an option
-        if (argc > 2) {
-            // - move the function to before optional arguments
-            lua_insert(L, 2); // moves -1 to position N
-            //   - stack should be: pool, hash, func, optN
-        }
-
         // - now create the copy pool table
         lua_createtable(L, hs->pool_size, 0); // give the new pool table a sizing hint.
         for (int x = 1; x <= hs->pool_size; x++) {
@@ -1692,9 +1685,21 @@ static int mcplib_hash_selector(lua_State *L) {
             lua_rawseti(L, -2, x);
         }
 
+        // - if argc > 2 we have an option.
+        // this needs to go after the pool copy in the stack:
+        int callargs = 1;
+        if (argc > 2) {
+            // we can either use lua_insert() or possibly _rotate to shift
+            // things into the right place, but simplest is to just copy the
+            // option arg to the end of the stack.
+            lua_pushvalue(L, 3);
+            callargs++;
+            //   - stack should be: pool, hash, func, pool, optN
+        }
+
         // call the hash init function.
         // FIXME: if optarg 1 is + argc-2?
-        int res = lua_pcall(L, 1, 2, 0);
+        int res = lua_pcall(L, callargs, 2, 0);
 
         if (res != LUA_OK) {
             lua_error(L); // error should be on the stack already.

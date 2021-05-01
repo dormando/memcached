@@ -84,9 +84,11 @@ function mcp_config_selectors(oldss)
     -- TODO: is this a good place to add prefixing/hash editing?
     for _, subs in pairs(main_zones) do
         for k, v in pairs(subs) do
-            -- switch the next two lines if you want to test the ketama
-            -- loadable module.
-            --subs[k] = mcp.hash_selector(v, ketama)
+            -- use next line instead for a third party ketama hash
+            -- subs[k] = mcp.hash_selector(v, ketama)
+            -- this line overrides the default bucket size for ketama
+            -- subs[k] = mcp.hash_selector(v, ketama, 80)
+            -- this line uses the default murmur3 straight hash.
             subs[k] = mcp.hash_selector(v)
         end
     end
