@@ -2161,7 +2161,7 @@ static uint32_t mcplib_jump_hash_get_server(const void *key, size_t len, void *c
         hash = hash * 2862933555777941757ULL + 1;
         j = (b + 1) * ((double)(1LL << 31) / (double)((hash >> 33) + 1));
     }
-    return b;
+    return b+1; // FIXME: do the -1 just for ketama and remove from internal code?
 }
 
 // stack = [pool, option]

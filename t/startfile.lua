@@ -90,6 +90,14 @@ function mcp_config_selectors(oldss)
             -- subs[k] = mcp.hash_selector(v, ketama, 80)
             -- this line uses the default murmur3 straight hash.
             subs[k] = mcp.hash_selector(v)
+
+            -- use this next line instead for jump hash.
+            -- the order of servers in the pool argument _must_ not change!
+            -- adding the seed string will give a different key distribution
+            -- for each zone.
+            -- NOTE: 'k' may not be the right seed here:
+            -- instead stitch main_zone's key + the sub key?
+            --subs[k] = mcp.hash_selector(v, mcp.hash_jump, { seed = k })
         end
     end
 
