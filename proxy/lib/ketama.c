@@ -164,6 +164,7 @@ static int ketama_new(lua_State *L) {
         lua_Integer id = lua_tointeger(L, -1);
         lua_pop(L, 1);
 
+        // FIXME: we need to do the lua_pop after string assembly to be safe.
         lua_getfield(L, -1, "hostname");
         parts[0] = lua_tolstring(L, -1, &partlens[0]);
         lua_pop(L, 1);

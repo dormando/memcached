@@ -15,6 +15,8 @@
 #include "proto_text.h"
 #include "murmur3_hash.h"
 #include "queue.h"
+#define XXH_INLINE_ALL // modifier for xxh3's include below
+#include "xxhash.h"
 
 // TODO: better if an init option turns this on/off.
 #ifdef PROXY_DEBUG
@@ -2138,6 +2140,84 @@ static int mcplib_request_gc(lua_State *L) {
 
 /*** END REQUET PARSER AND OBJECT ***/
 
+/*** START jump consistent hash library ***/
+// TODO: easy candidate for splitting to another .c, but I want this built in
+// instead of as a .so so make sure it's linked directly.
+
+typedef struct {
+    struct proxy_hash_caller phc; // passed back to proxy API
+    uint64_t seed;
+    unsigned int buckets;
+} mcplib_jump_hash_t;
+
+static uint32_t mcplib_jump_hash_get_server(const void *key, size_t len, void *ctx) {
+    mcplib_jump_hash_t *jh = ctx;
+
+    uint64_t hash = XXH3_64bits_withSeed(key, len, jh->seed);
+
+    int64_t b = -1, j = 0;
+    while (j < jh->buckets) {
+        b = j;
+        hash = hash * 2862933555777941757ULL + 1;
+        j = (b + 1) * ((double)(1LL << 31) / (double)((hash >> 33) + 1));
+    }
+    return b;
+}
+
+// stack = [pool, option]
+static int mcplib_jump_hash_new(lua_State *L) {
+    uint64_t seed = 0;
+    const char *seedstr = NULL;
+    size_t seedlen = 0;
+
+    luaL_checktype(L, 1, LUA_TTABLE);
+    lua_Unsigned buckets = lua_rawlen(L, 1);
+
+    int argc = lua_gettop(L);
+    if (argc > 1) {
+        // options supplied. to be specified as a table.
+        // { seed = "foo" }
+        luaL_checktype(L, 2, LUA_TTABLE);
+        // FIXME: adjust so we ensure/error on this being a string?
+        if (lua_getfield(L, 2, "seed") != LUA_TNIL) {
+            seedstr = lua_tolstring(L, -1, &seedlen);
+            seed = XXH3_64bits(seedstr, seedlen);
+        } else {
+            dump_stack(L);
+        }
+        lua_pop(L, 1);
+    }
+
+    mcplib_jump_hash_t *jh = lua_newuserdatauv(L, sizeof(mcplib_jump_hash_t), 0);
+    // TODO: check jh.
+
+    // don't need to loop through the table at all, just need its length.
+    // could optimize startup time by adding hints to the module for how to
+    // format pool (ie; just a total count or the full table)
+    jh->seed = seed;
+    jh->buckets = buckets;
+    jh->phc.ctx = jh;
+    jh->phc.selector_func = mcplib_jump_hash_get_server;
+
+    lua_pushlightuserdata(L, &jh->phc);
+
+    // - return [UD, lightuserdata]
+    return 2;
+}
+
+static int mcplib_open_jump_hash(lua_State *L) {
+    const struct luaL_Reg jump_f[] = {
+        {"new", mcplib_jump_hash_new},
+        {NULL, NULL},
+    };
+
+    luaL_newlib(L, jump_f);
+
+    return 1;
+}
+
+/*** END jump consistent hash library ***/
+
 // Creates and returns the top level "mcp" module
 int proxy_register_libs(LIBEVENT_THREAD *t, void *ctx) {
     lua_State *L = ctx;
@@ -2214,6 +2294,9 @@ int proxy_register_libs(LIBEVENT_THREAD *t, void *ctx) {
     // hash function for selectors.
     // have to wrap the function in a struct because function pointers aren't
     // pointer pointers :)
+    mcplib_open_jump_hash(L);
+    lua_setfield(L, -2, "hash_jump");
+    // FIXME: remove this once multi-probe is in, use that as default instead.
     lua_pushlightuserdata(L, &mcplib_hashfunc_murmur3);
     lua_setfield(L, -2, "hash_murmur3");
 
