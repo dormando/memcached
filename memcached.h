@@ -640,8 +640,7 @@ typedef struct {
     int napi_id;                /* napi id associated with this thread */
 #ifdef PROXY
     void *L;
-    int proxy_hook; // TODO: temporary, probably unused.
-    int proxy_attach_ref; // TODO: temporary single callback value :)
+    void *proxy_hooks;
     // TODO: add ctx object so we can attach to queue.
 #endif
 } LIBEVENT_THREAD;

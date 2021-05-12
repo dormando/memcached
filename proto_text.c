@@ -13,8 +13,6 @@
 #include <string.h>
 #include <stdlib.h>
 
-static void process_command(conn *c, char *command);
-
 /*
  * we get here after reading the value in set/add/replace commands. The command
  * has been stored in c->cmd, and the item is ready in c->item.
@@ -395,7 +393,7 @@ int try_read_command_ascii(conn *c) {
     assert(cont <= (c->rcurr + c->rbytes));
 
     c->last_cmd_time = current_time;
-    process_command(c, c->rcurr);
+    process_command_ascii(c, c->rcurr);
 
     c->rbytes -= (cont - c->rcurr);
     c->rcurr = cont;
@@ -2529,7 +2527,7 @@ static void process_refresh_certs_command(conn *c, token_t *tokens, const size_t
 // we can't drop out and back in again.
 // Leaving this note here to spend more time on a fix when necessary, or if an
 // opportunity becomes obvious.
-static void process_command(conn *c, char *command) {
+void process_command_ascii(conn *c, char *command) {
 
     token_t tokens[MAX_TOKENS];
     size_t ntokens;

@@ -243,5 +243,5 @@ function mcp_config_routes(main_zones)
     -- also wrap the request string with a convenience object until the C bits
     -- are attached to the internal parser.
     --mcp.attach(mcp.CMD_ANY, function (r) return routetop(r) end)
-    mcp.attach(mcp.CMD_ANY, command_factory(top_map, routetop))
+    mcp.attach(mcp.CMD_ANY_STORAGE, command_factory(top_map, routetop))
 end
