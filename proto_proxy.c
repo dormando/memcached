@@ -87,6 +87,15 @@ enum proxy_defines {
 };
 #undef X
 
+// certain classes of ascii commands have similar parsing (ie;
+// get/gets/gat/gats). Use types so we don't have to test a ton of them.
+enum proxy_cmd_types {
+    CMD_TYPE_GENERIC = 0,
+    CMD_TYPE_GET, // get/gets/gat/gats
+    CMD_TYPE_UPDATE, // add/set/cas/prepend/append/replace
+    CMD_TYPE_META, // m*'s.
+};
+
 struct proxy_hook {
     // TODO: C func ptr. If non-null, call directly instead of via lua.
     int lua_ref;
@@ -120,38 +129,46 @@ typedef struct mcp_request_s mcp_request_t;
 typedef struct mcp_parser_s mcp_parser_t;
 
 // function for finalizing the parsing of a request.
-typedef int (*mcp_parser_func)(mcp_parser_t *pr);
 struct mcp_parser_set_s {
     uint32_t flags;
     int exptime;
 };
-// FIXME: when parsing off of mcp_request_t, key/etc need to point into the
-// copied buffer... so we need to replace cur? treat cur as an int/offset
-// instead?
+
+struct mcp_parser_get_s {
+    int exptime; // in cases of gat/gats.
+};
+
+// Note that we must use offsets into request for tokens,
+// as *request can change between parsing and later accessors.
+// TODO: just use uint16_t off/len token array?
 struct mcp_parser_s {
     int command;
     int parsed; // how far into the request we parsed already
-    mcp_parser_func func;
-    char *request;
-    const char *key; // keys are common, so we pull these at a higher level.
+    const char *request;
     void *vbuf; // temporary buffer for holding value lengths.
+    int cmd_type; // command class.
     int reqlen; // full length of request buffer.
     int vlen;
+    int key; // offset of the key.
     int16_t klen; // length of key.
     bool has_space; // a space was found after the command token.
     union {
         struct mcp_parser_set_s set;
+        struct mcp_parser_get_s get;
     } t;
 };
+
+#define MCP_PARSER_KEY(pr) (&pr.request[pr.key])
 
 // TODO: need to confirm that c->rbuf is safe to use the whole time.
 // - I forgot what this was already? need to re-check. have addressed other
 // prior comments already.
 #define MAX_REQ_TOKENS 2
 struct mcp_request_s {
-    struct mcp_parser_s pr; // non-lua-specific parser handling.
+    mcp_parser_t pr; // non-lua-specific parser handling.
     mcp_backend_t *be; // backend handling this request.
     bool lua_key; // if we've pushed the key to lua.
+    bool ascii_multiget; // ascii multiget mode. (hide errors/END)
 };
 
 typedef STAILQ_HEAD(io_head_s, _io_pending_proxy_t) io_head_t;
@@ -224,6 +241,7 @@ struct _io_pending_proxy_t {
     int iovcnt; // 1 or 2...
     mcp_resp_t *client_resp; // reference (currently pointing to a lua object)
     bool flushed; // whether we've fully written this request to a backend.
+    bool ascii_multiget; // passed on from mcp_r_t
 };
 
 // TODO: hash func should take an initializer
@@ -250,7 +268,10 @@ typedef struct {
 } mcp_hash_selector_t;
 
 static int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t *p, conn *c);
-static void proxy_process_command(conn *c, char *command, size_t cmdlen);
+#define PROCESS_MULTIGET true
+#define PROCESS_NORMAL false
+static void proxy_process_command(conn *c, char *command, size_t cmdlen, bool multiget);
+static int _process_request_key(mcp_parser_t *pr);
 static int process_request(mcp_parser_t *pr, const char *command, size_t cmdlen);
 static void dump_stack(lua_State *L);
 static void mcp_queue_io(conn *c, mc_resp *resp, int coro_ref, lua_State *Lc);
@@ -656,7 +677,7 @@ int try_read_command_proxy(conn *c) {
     assert(cont <= (c->rcurr + c->rbytes));
 
     c->last_cmd_time = current_time;
-    proxy_process_command(c, c->rcurr, cont - c->rcurr);
+    proxy_process_command(c, c->rcurr, cont - c->rcurr, PROCESS_NORMAL);
 
     c->rbytes -= (cont - c->rcurr);
     c->rcurr = cont;
@@ -1135,6 +1156,12 @@ static int proxy_backend_drive_machine(mcp_backend_t *be) {
             }
 
             if (res) {
+                if (p->ascii_multiget && r->resp.type == MCMC_RESP_END) {
+                    // Ascii multiget hack mode; consume END's
+                    be->state = mcp_backend_next;
+                    break;
+                }
+
                 // r->resp.reslen + r->resp.vlen is the total length of the response.
                 // TODO: need to associate a buffer with this response...
                 // for now lets abuse write_and_free on mc_resp and simply malloc the
@@ -1223,8 +1250,12 @@ static int proxy_backend_drive_machine(mcp_backend_t *be) {
             } else {
                 // response is good.
                 // FIXME: copy what the server actually sent?
-                memcpy(r->buf+r->blen, ENDSTR, ENDLEN);
-                r->blen += 5;
+                if (!p->ascii_multiget) {
+                    // sigh... if part of a multiget we need to eat the END
+                    // markers down here.
+                    memcpy(r->buf+r->blen, ENDSTR, ENDLEN);
+                    r->blen += 5;
+                }
             }
 
             be->state = mcp_backend_next;
@@ -1473,7 +1504,7 @@ static void proxy_backend_handler(const int fd, const short which, void *arg) {
     }
 }
 
-static void proxy_process_command(conn *c, char *command, size_t cmdlen) {
+static void proxy_process_command(conn *c, char *command, size_t cmdlen, bool multiget) {
     assert(c != NULL);
     LIBEVENT_THREAD *thr = c->thread;
     struct proxy_hook *hooks = thr->proxy_hooks;
@@ -1487,10 +1518,6 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen) {
     // also calls resp_start().
     // Tighter integration later should obviate the need for this, it is not a
     // permanent solution.
-
-    // TODO: does process_request() need to also categorize requests?
-    // ie; get-type, set-type (has value) and so on.
-    // find the command and string parser function.
     int ret = process_request(&pr, command, cmdlen);
     if (ret != 0) {
         if (!resp_start(c)) {
@@ -1505,15 +1532,6 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen) {
         return;
     }
 
-    // TODO:
-    // thr->hooks array?
-    // CMD_ANY just for-loops and sets that function everywhere?
-    // struct { c_func; int lua_ref; bool lua; }
-    // if (lua) { rawgeti(etc); }
-    // mcp_new_request(final parser)
-    // - CHECK FOR ERRORS
-    // change vlen check to "has_value"
-    // - ENSURE 0 SIZE VALUES WORK!
     struct proxy_hook *hook = &hooks[pr.command];
 
     if (!hook->is_lua) {
@@ -1533,9 +1551,54 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen) {
         return;
     }
 
-    // TODO: if ascii multiget, we turn this into a self-calling loop :(
+    // If ascii multiget, we turn this into a self-calling loop :(
     // create new request with next key, call this func again, then advance
     // original string.
+    // might be better to split this function; the below bits turn into a
+    // function call, then we don't re-process the above bits in the same way?
+    // The way this is detected/passed on is very fragile.
+    if (!multiget && pr.cmd_type == CMD_TYPE_GET && pr.has_space) {
+        // TODO: need some way to abort this.
+        while (pr.klen != 0) {
+            char temp[KEY_MAX_LENGTH + 30];
+            size_t off = 0;
+            switch (pr.command) {
+                case CMD_GET:
+                    memcpy(temp, "get ", 4);
+                    off += 4;
+                    break;
+                case CMD_GETS:
+                    break;
+                case CMD_GAT:
+                    break;
+                case CMD_GATS:
+                    break;
+            }
+            memcpy(temp+off, MCP_PARSER_KEY(pr), pr.klen);
+            memcpy(temp+off+pr.klen, "\r\n", 2);
+            proxy_process_command(c, temp, off+pr.klen+2, PROCESS_MULTIGET);
+
+            // now advance to the next key.
+            _process_request_key(&pr);
+
+            // TODO: somehow we need to chop the END\r\n from each
+            // sub-request.
+        }
+
+        if (!resp_start(c)) {
+            conn_set_state(c, conn_closing);
+            return;
+        }
+
+        // The above recursions should have created c->resp's in dispatch
+        // order.
+        // So now we add another one at the end to create the capping END
+        // string.
+        memcpy(c->resp->wbuf, ENDSTR, ENDLEN);
+        resp_add_iov(c->resp, c->resp->wbuf, ENDLEN);
+
+        return;
+    }
 
     if (!resp_start(c)) {
         conn_set_state(c, conn_closing);
@@ -1550,10 +1613,10 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen) {
     // pull the lua hook function onto the stack.
     lua_rawgeti(Lc, LUA_REGISTRYINDEX, hook->lua_ref);
 
-    // FIXME: think we need to parse the request before looking at attach, so
-    // we can attach to specific commands properly?
-    // TODO: split parse from new request.
     mcp_request_t *rq = mcp_new_request(Lc, &pr, command, cmdlen);
+    if (multiget) {
+        rq->ascii_multiget = true;
+    }
     // TODO: a better indicator of needing nread? pr->has_value?
     // TODO: lift this to a post-processor?
     if (rq->pr.vlen != 0) {
@@ -1623,6 +1686,7 @@ static void mcp_queue_io(conn *c, mc_resp *resp, int coro_ref, lua_State *Lc) {
     p->resp = resp;
     p->client_resp = r;
     p->flushed = false;
+    p->ascii_multiget = rq->ascii_multiget;
     resp->io_pending = (io_pending_t *)p;
 
     // top of the main thread should be our coroutine.
@@ -1639,7 +1703,7 @@ static void mcp_queue_io(conn *c, mc_resp *resp, int coro_ref, lua_State *Lc) {
     // The stringified request. This is also referencing into the coroutine
     // stack, which should be safe from gc.
     mcp_parser_t *pr = &rq->pr;
-    p->iov[0].iov_base = pr->request;
+    p->iov[0].iov_base = (char *)pr->request;
     p->iov[0].iov_len = pr->reqlen;
     p->iovcnt = 1;
     if (pr->vlen != 0) {
@@ -1869,7 +1933,7 @@ static int mcplib_hash_selector_call(lua_State *L) {
 
     // we have a fast path to the key/length.
     // FIXME: indicator for if request actually has a key token or not.
-    const char *key = rq->pr.key;
+    const char *key = MCP_PARSER_KEY(rq->pr);
     size_t len = rq->pr.klen;
     uint32_t lookup = ss->phc->selector_func(key, len, ss->phc->ctx);
 
@@ -1903,7 +1967,6 @@ static int mcplib_attach(lua_State *L) {
     int hook = luaL_checkinteger(L, -2);
     // pushvalue to dupe func and etc.
     // can leave original func on stack afterward because it'll get cleared.
-    // .... uhhh... loop through CMD_END_STORAGE ?
     int loop_end = 0;
     int loop_start = 1;
     if (hook == CMD_ANY) {
@@ -1955,22 +2018,26 @@ static void proxy_register_defines(lua_State *L) {
 /*** REQUEST PARSER AND OBJECT ***/
 
 static int _process_request_key(mcp_parser_t *pr) {
-    if (!pr->has_space) {
-        return -1;
-    }
-
+    pr->has_space = false;
     const char *cur = pr->request + pr->parsed;
     int remain = pr->reqlen - (pr->parsed + 2);
+    if (remain <= 0) {
+        pr->key = 0;
+        pr->klen = 0;
+        return 0;
+    }
     const char *s = memchr(cur, ' ', remain);
+    pr->key = cur - pr->request; // key offset.
     if (s != NULL) {
         // key is up to the next space.
-        pr->key = cur;
         pr->klen = s - cur;
+        if (*s == ' ') {
+            pr->has_space = true;
+        }
     } else {
-        pr->key = cur;
         pr->klen = remain;
     }
-    assert(pr->klen != 0);
+    pr->parsed += pr->klen+1;
 
     return 0;
 }
@@ -1990,7 +2057,7 @@ static int _process_request_storage(mcp_parser_t *pr) {
     const char *s = memchr(cur, ' ', pr->reqlen - (pr->parsed + 2));
     if (s != NULL) {
         // Found another space, which means we at least have a key.
-        pr->key = cur;
+        pr->key = cur - pr->request;
         pr->klen = s - cur;
         cur = s + 1;
     } else {
@@ -2034,16 +2101,6 @@ static int _process_request_storage(mcp_parser_t *pr) {
     return 0;
 }
 
-// Finalize the request parser. Leaving this indirection in case I want to
-// expand the finalization steps.
-static int process_request_final(mcp_parser_t *pr) {
-    if (pr->func != NULL) {
-        return pr->func(pr);
-    } else {
-        return 0;
-    }
-}
-
 // TODO: return code ENUM with error types.
 // FIXME: the mcp_parser_t bits have ended up being more fragile than I hoped.
 // careful zero'ing is required. revisit?
@@ -2056,6 +2113,8 @@ static int process_request(mcp_parser_t *pr, const char *command, size_t cmdlen)
     bool has_space;
 
     const char *s = memchr(command, ' ', cmdlen-2);
+    // TODO: has_space -> has_tokens
+    // has_space resered for ascii multiget?
     if (s != NULL) {
         cl = s - command;
         has_space = true;
@@ -2063,10 +2122,15 @@ static int process_request(mcp_parser_t *pr, const char *command, size_t cmdlen)
         cl = cmdlen - 2; // FIXME: ensure cmdlen can never be < 2?
         has_space = false;
     }
+    pr->has_space = has_space;
+    pr->parsed = cl + 1;
+    pr->request = command;
+    pr->reqlen = cmdlen;
 
     //pr->vlen = 0; // FIXME: remove this once set indicator is decided
     int cmd = -1;
-    mcp_parser_func func = NULL;
+    int type = CMD_TYPE_GENERIC;
+    int ret = 0;
 
     switch (cl) {
         case 0:
@@ -2074,6 +2138,7 @@ static int process_request(mcp_parser_t *pr, const char *command, size_t cmdlen)
             // falls through with cmd as -1. should error.
             break;
         case 2:
+            // TODO: meta support is gated on some protocol fixes.
             if (cm[0] == 'm') {
                 switch (cm[1]) {
                     case 'g':
@@ -2104,29 +2169,40 @@ static int process_request(mcp_parser_t *pr, const char *command, size_t cmdlen)
             if (cm[0] == 'g') {
                 if (cm[1] == 'e' && cm[2] == 't') {
                     cmd = CMD_GET;
-                    func = _process_request_key;
+                    type = CMD_TYPE_GET;
+                    ret = _process_request_key(pr);
                 }
                 if (cm[1] == 'a' && cm[2] == 't') {
+                    type = CMD_TYPE_GET;
                     cmd = CMD_GAT;
+                    // TODO: gat <exptime> <key>*\r\n
                 }
             } else if (cm[0] == 's' && cm[1] == 'e' && cm[2] == 't') {
                 cmd = CMD_SET;
-                func = _process_request_storage;
+                ret = _process_request_storage(pr);
             } else if (cm[0] == 'a' && cm[1] == 'd' && cm[2] == 'd') {
                 cmd = CMD_ADD;
-                func = _process_request_storage;
+                ret = _process_request_storage(pr);
             } else if (cm[0] == 'c' && cm[1] == 'a' && cm[2] == 's') {
                 cmd = CMD_CAS;
-                func = _process_request_storage;
+                ret = _process_request_storage(pr);
             }
             break;
         case 4:
             if (cm[0] == 'g' && cm[1] == 'e' && cm[2] == 't' && cm[3] == 's') {
                 cmd = CMD_GETS;
+                type = CMD_TYPE_GET;
+                ret = _process_request_key(pr);
             } else if (cm[0] == 'i' && cm[1] == 'n' && cm[2] == 'c' && cm[3] == 'r') {
                 cmd = CMD_INCR;
+                // TODO: incr <key> <value>
             } else if (cm[0] == 'd' && cm[1] == 'e' && cm[2] == 'c' && cm[3] == 'r') {
                 cmd = CMD_DECR;
+                // TODO: decr <key> <value>
+            } else if (cm[0] == 'g' && cm[1] == 'a' && cm[2] == 't' && cm[3] == 's') {
+                cmd = CMD_GATS;
+                type = CMD_TYPE_GET;
+                // TODO: gats <exptime> <key>*\r\n
             } else if (strncmp(cm, "quit", 4) == 0) {
                 cmd = CMD_QUIT;
             }
@@ -2134,46 +2210,44 @@ static int process_request(mcp_parser_t *pr, const char *command, size_t cmdlen)
         case 5:
             if (strncmp(cm, "touch", 5) == 0) {
                 cmd = CMD_TOUCH;
-                func = _process_request_key;
+                // TODO: touch <key> <exptime>
+                ret = _process_request_key(pr);
             } else if (strncmp(cm, "stats", 5) == 0) {
                 cmd = CMD_STATS;
-                func = _process_request_key;
+                ret = _process_request_key(pr);
                 // :key() should give the stats sub-command?
             }
             break;
         case 6:
             if (strncmp(cm, "delete", 6) == 0) {
                 cmd = CMD_DELETE;
-                func = _process_request_key;
+                ret = _process_request_key(pr);
             } else if (strncmp(cm, "append", 6) == 0) {
                 cmd = CMD_APPEND;
-                func = _process_request_storage;
+                ret = _process_request_storage(pr);
             }
             break;
         case 7:
             if (strncmp(cm, "replace", 7) == 0) {
                 cmd = CMD_REPLACE;
-                func = _process_request_storage;
+                ret = _process_request_storage(pr);
             } else if (strncmp(cm, "prepend", 7) == 0) {
                 cmd = CMD_PREPEND;
-                func = _process_request_storage;
+                ret = _process_request_storage(pr);
             } else if (strncmp(cm, "version", 7) == 0) {
                 cmd = CMD_VERSION;
             }
             break;
     }
 
-    // TODO: check ret and fail if needed.
-    if (cmd == -1) {
+    // TODO: log more specific error code.
+    if (cmd == -1 || ret != 0) {
         return -1;
     }
     // TODO: check if cmd unfound? need special code?
-
     pr->command = cmd;
-    pr->func = func;
-    pr->parsed = cl + 1;
-    pr->reqlen = cmdlen;
-    pr->has_space = has_space;
+    pr->cmd_type = type;
+
     return 0;
 }
 
@@ -2184,21 +2258,14 @@ static mcp_request_t *mcp_new_request(lua_State *L, mcp_parser_t *pr, const char
     memset(rq, 0, sizeof(*rq));
     memcpy(&rq->pr, pr, sizeof(*pr));
 
-    rq->pr.request = malloc(cmdlen);
     // TODO: check rq->request and lua-fail properly
+    char *request_copy = malloc(cmdlen);
+    memcpy(request_copy, command, cmdlen);
+    rq->pr.request = request_copy;
     rq->pr.reqlen = cmdlen;
-    memcpy(rq->pr.request, command, cmdlen);
 
     luaL_getmetatable(L, "mcp.request");
     lua_setmetatable(L, -2);
-
-    // We've replaced pr's request pointers with copies to the original
-    // string. Now we need to call the finalizer to ensure any pointers point
-    // into the copy of the string.
-    if (process_request_final(&rq->pr) != 0) {
-        proxy_lua_error(L, "failed to parse request");
-        return NULL;
-    }
 
     // at this point we should know if we have to bounce through _nread to
     // get item data or not.
@@ -2213,8 +2280,9 @@ static int mcplib_request(lua_State *L) {
     mcp_parser_t pr = {0};
     const char *cmd = luaL_checklstring(L, 1, &len);
     const char *val = luaL_optlstring(L, 2, NULL, &vlen);
-    // TODO: have to run both pre and post-parser against cmd here.
 
+    // FIXME: if we inline the userdata we can avoid memcpy'ing the parser
+    // structure from the stack? but causes some code duplication.
     if (process_request(&pr, cmd, len) != 0) {
         proxy_lua_error(L, "failed to parse request");
         return 0;
@@ -2242,7 +2310,7 @@ static int mcplib_request_key(lua_State *L) {
 
     if (!rq->lua_key) {
         rq->lua_key = true;
-        lua_pushlstring(L, rq->pr.key, rq->pr.klen);
+        lua_pushlstring(L, MCP_PARSER_KEY(rq->pr), rq->pr.klen);
         lua_pushvalue(L, -1); // push an extra copy to gobble.
         lua_setiuservalue(L, -3, 1);
         // TODO: push nil if no key parsed.
@@ -2262,7 +2330,11 @@ static int mcplib_request_command(lua_State *L) {
 static int mcplib_request_gc(lua_State *L) {
     mcp_request_t *rq = luaL_checkudata(L, -1, "mcp.request");
     if (rq->pr.request != NULL) {
-        free(rq->pr.request);
+        // FIXME: discarding const here, fixing an error around free.
+        // Can probably do something cleaner, so leaving a note here.
+        // Think the answer is to move *request to mcp_r_t and only handle
+        // const within the parser code.
+        free((char *)rq->pr.request);
     }
     // FIXME: during nread c->item is the malloc'ed buffer. not yet put into
     // rq->buf - is this properly freed if the connection dies before
