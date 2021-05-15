@@ -10,6 +10,11 @@
 #include <lualib.h>
 #include <lauxlib.h>
 
+#if defined(__linux__)
+#define USE_EVENTFD 1
+#include <sys/eventfd.h>
+#endif
+
 #include "memcached.h"
 #include "proto_proxy.h"
 #include "proto_text.h"
@@ -204,8 +209,12 @@ struct proxy_event_thread_s {
     be_head_t be_head; // stack of backends for processing.
     mcp_backend_t *iter; // used as an iterator through the be list
     proxy_event_io_thread_t *bt; // array of io threads.
+#ifdef USE_EVENTFD
+    eventfd_t event_fd;
+#else
     int notify_receive_fd;
     int notify_send_fd;
+#endif
 };
 
 // threads owned by an event thread for submitting syscalls.
@@ -355,7 +364,10 @@ void proxy_init(void) {
     settings.proxy_threads = threads;
     for (int i = 0; i < 1; i++) {
         proxy_event_thread_t *t = &threads[i];
-        // TODO: "if linux, use eventfd instead"
+#ifdef USE_EVENTFD
+        t->event_fd = eventfd(0, EFD_NONBLOCK);
+        // FIXME: eventfd can fail?
+#else
         int fds[2];
         if (pipe(fds)) {
             perror("can't create proxy backend notify pipe");
@@ -364,7 +376,7 @@ void proxy_init(void) {
 
         t->notify_receive_fd = fds[0];
         t->notify_send_fd = fds[1];
-
+#endif
         struct event_config *ev_config;
         ev_config = event_config_new();
         event_config_set_flag(ev_config, EVENT_BASE_FLAG_NOLOCK);
@@ -378,8 +390,13 @@ void proxy_init(void) {
         // listen for notifications.
         // NULL was thread_libevent_process
         // FIXME: use modern format? (event_assign)
+#ifdef USE_EVENTFD
+        event_set(&t->notify_event, t->event_fd,
+              EV_READ | EV_PERSIST, proxy_event_handler, t);
+#else
         event_set(&t->notify_event, t->notify_receive_fd,
               EV_READ | EV_PERSIST, proxy_event_handler, t);
+#endif
         event_base_set(t->base, &t->notify_event);
         if (event_add(&t->notify_event, 0) == -1) {
             fprintf(stderr, "Can't monitor libevent notify pipe\n");
@@ -579,10 +596,19 @@ void proxy_submit_cb(void *ctx, void *ctx_stack) {
     pthread_mutex_unlock(&e->mutex);
 
     // Signal to check queue.
-    // TODO: eventfd, error handling.
+    // TODO: error handling.
+#ifdef USE_EVENTFD
+    uint64_t u = 1;
+    // FIXME: check result? is it ever possible to get a short write/failure
+    // for an eventfd?
+    if (write(e->event_fd, &u, sizeof(uint64_t)) != sizeof(uint64_t)) {
+        assert(1 == 0);
+    }
+#else
     if (write(e->notify_send_fd, "w", 1) <= 0) {
         assert(1 == 0);
     }
+#endif
 
     return;
 }
@@ -723,17 +749,26 @@ static void proxy_event_handler(evutil_socket_t fd, short which, void *arg) {
     proxy_event_thread_t *t = arg;
     io_head_t head;
 
+#ifdef USE_EVENTFD
+    uint64_t u;
+    if (read(fd, &u, sizeof(uint64_t)) != sizeof(uint64_t)) {
+        // FIXME: figure out if this is impossible, and how to handle if not.
+        assert(1 == 0);
+    }
+#else
     char buf[1];
     // TODO: This is a lot more fatal than it should be. can it fail? can
     // it blow up the server?
-    // TODO: this will batch a lot of requests in one shot, but we will
-    // get as many wakeup's to read() the pipe as individual submissions.
-    // switching to event_fd should fix this, since we can read the full
-    // number of events in one shot.
+    // FIXME: a cross-platform method of speeding this up would be nice. With
+    // event fds we can queue N events and wakeup once here.
+    // If we're pulling one byte out of the pipe at a time here it'll just
+    // wake us up too often.
+    // If the pipe is O_NONBLOCK then maybe just a larger read would work?
     if (read(fd, buf, 1) != 1) {
         P_DEBUG("%s: pipe read failed\n", __func__);
         return;
     }
+#endif
 
     STAILQ_INIT(&head);
     STAILQ_INIT(&t->be_head);
