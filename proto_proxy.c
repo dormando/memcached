@@ -1180,6 +1180,7 @@ static int proxy_backend_drive_machine(mcp_backend_t *be) {
                     // contained.
                     break;
                 case MCMC_RESP_GENERIC:
+                case MCMC_RESP_NUMERIC:
                     break;
                 // TODO: No-op response?
                 default:
@@ -2196,6 +2197,8 @@ static int process_request(mcp_parser_t *pr, const char *command, size_t cmdlen)
                         break;
                     case 'e':
                         cmd = CMD_ME;
+                        // TODO: not much special processing here; binary keys
+                        ret = _process_request_key(pr);
                         break;
                 }
             }
@@ -2231,9 +2234,11 @@ static int process_request(mcp_parser_t *pr, const char *command, size_t cmdlen)
             } else if (cm[0] == 'i' && cm[1] == 'n' && cm[2] == 'c' && cm[3] == 'r') {
                 cmd = CMD_INCR;
                 // TODO: incr <key> <value>
+                ret = _process_request_key(pr);
             } else if (cm[0] == 'd' && cm[1] == 'e' && cm[2] == 'c' && cm[3] == 'r') {
                 cmd = CMD_DECR;
                 // TODO: decr <key> <value>
+                ret = _process_request_key(pr);
             } else if (cm[0] == 'g' && cm[1] == 'a' && cm[2] == 't' && cm[3] == 's') {
                 cmd = CMD_GATS;
                 type = CMD_TYPE_GET;
