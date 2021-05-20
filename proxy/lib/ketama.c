@@ -175,34 +175,24 @@ static int ketama_new(lua_State *L) {
         parts[2] = lua_tolstring(L, -1, &partlens[2]);
         lua_pop(L, 1);
 
-        size_t total = 0;
+        size_t hashstring_size = 0;
         for (int x = 0; x < PARTS; x++) {
-            total += partlens[x];
+            hashstring_size += partlens[x];
         }
-        // add extra space for the repititons.
-        char *buf = malloc(total + 16);
 
-        // add 3 more bytes for the delimiters used
-        total = total + 3;
+        // We have 3 delimiters in the final hashstring and an index
+        // 16 bytes is plenty to accomodate this requirement.
+        hashstring_size = hashstring_size + 16;
+        char *hashstring = malloc(hashstring_size);
 
         for (int k = 0; k < bucket_size / 4; k++) {
             unsigned char digest[16];
 
-            int num_bytes = 0;
-            int dup_k = k;
-
-            while (dup_k != 0) {
-                dup_k = dup_k / 10;
-                ++num_bytes;
-            }
-            // special case
-            if (k == 0) ++num_bytes;
-
             // - create hashing string for ketama
-            snprintf(buf, total + num_bytes + 1, "%s/%s:%s-%d", parts[0], parts[1], parts[2], k);
+            snprintf(hashstring, hashstring_size, "%s/%s:%s-%d", parts[0], parts[1], parts[2], k);
             // - md5() hash it
             // mostly from ketama.c
-            ketama_md5_digest(buf, digest);
+            ketama_md5_digest(hashstring, digest);
 
             /* Use successive 4-bytes from hash as numbers
              * for the points on the circle: */
