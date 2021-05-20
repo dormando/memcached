@@ -1910,8 +1910,8 @@ static int mcplib_hash_selector(lua_State *L) {
             lua_setfield(L, -2, "id");
             // TODO: need to get hostname (Separate from logical name?)
             // into the backend objects somehow.
-            lua_pushstring(L, "unknown");
-            lua_setfield(L, -2, "thing");
+            lua_pushstring(L, be->ip);
+            lua_setfield(L, -2, "hostname");
             lua_pushstring(L, be->ip);
             lua_setfield(L, -2, "addr");
             lua_pushstring(L, be->port);
