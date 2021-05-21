@@ -182,7 +182,7 @@ static int ketama_new(lua_State *L) {
 
         // We have 3 delimiters in the final hashstring and an index
         // 16 bytes is plenty to accomodate this requirement.
-        hashstring_size = hashstring_size + 16;
+        hashstring_size += 16;
         char *hashstring = malloc(hashstring_size);
 
         for (int k = 0; k < bucket_size / 4; k++) {
