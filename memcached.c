@@ -523,6 +523,7 @@ void conn_close_idle(conn *c) {
 
 static void _conn_event_readd(conn *c) {
     c->ev_flags = EV_READ | EV_PERSIST;
+    event_del(&c->event);
     event_set(&c->event, c->sfd, c->ev_flags, event_handler, (void *)c);
     event_base_set(c->thread->base, &c->event);
 
