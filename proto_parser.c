@@ -1571,13 +1571,17 @@ void process_mdelete_cmd(LIBEVENT_THREAD *t, mcp_parser_t *pr, mc_resp *resp) {
     it = item_get_locked(key, nkey, t, DONT_UPDATE, &hv);
     if (it) {
         // allow only deleting/marking if a CAS value matches.
-        if (of.has_cas && ITEM_get_cas(it) != of.req_cas_id) {
-            pthread_mutex_lock(&t->stats.mutex);
-            t->stats.delete_misses++;
-            pthread_mutex_unlock(&t->stats.mutex);
+        if (of.has_cas) {
+            // W flag allows CAS to win if larger
+            if ((of.set_lww && ITEM_get_cas(it) <= of.req_cas_id)
+                    || ITEM_get_cas(it) != of.req_cas_id) {
+                pthread_mutex_lock(&t->stats.mutex);
+                t->stats.delete_misses++;
+                pthread_mutex_unlock(&t->stats.mutex);
 
-            memcpy(resp->wbuf, "EX", 2);
-            goto cleanup;
+                memcpy(resp->wbuf, "EX", 2);
+                goto cleanup;
+            }
         }
 
         // If requested, create a new empty tombstone item.
@@ -1585,8 +1589,12 @@ void process_mdelete_cmd(LIBEVENT_THREAD *t, mcp_parser_t *pr, mc_resp *resp) {
             item *new_it = item_alloc(key, nkey, of.client_flags, of.exptime, 2);
             if (new_it != NULL) {
                 memcpy(ITEM_data(new_it), "\r\n", 2);
+                uint64_t in_cas = ITEM_get_cas(it);
+                if (of.set_lww) {
+                    in_cas = of.has_cas_in ? of.cas_id_in : of.req_cas_id;
+                }
                 if (do_store_item(new_it, NREAD_SET, t, hv, NULL, NULL,
-                            of.has_cas_in ? of.cas_id_in : ITEM_get_cas(it), CAS_NO_STALE, of.set_lww)) {
+                            in_cas, CAS_NO_STALE, of.set_lww)) {
                     do_item_remove(it);
                     it = new_it;
                 } else {
@@ -1632,12 +1640,42 @@ void process_mdelete_cmd(LIBEVENT_THREAD *t, mcp_parser_t *pr, mc_resp *resp) {
         }
         goto cleanup;
     } else {
-        pthread_mutex_lock(&t->stats.mutex);
-        t->stats.delete_misses++;
-        pthread_mutex_unlock(&t->stats.mutex);
+        if (of.remove_val && of.set_lww && of.req_cas_id) {
+            // TODO: fail unless T set. maybe, as the old code didn't
+            item *new_it = item_alloc(key, nkey, of.client_flags, of.exptime, 2);
+            if (new_it != NULL) {
+                memcpy(ITEM_data(new_it), "\r\n", 2);
+                uint64_t in_cas = of.has_cas_in ? of.cas_id_in : of.req_cas_id;
+                if (do_store_item(new_it, NREAD_SET, t, hv, NULL, NULL,
+                            in_cas, CAS_NO_STALE, of.set_lww)) {
+                    do_item_remove(it);
+                    it = new_it;
+                } else {
+                    do_item_remove(new_it);
+                    memcpy(resp->wbuf, "NS", 2);
+                    goto cleanup;
+                }
 
-        memcpy(resp->wbuf, "NF", 2);
-        goto cleanup;
+                if (of.set_stale) {
+                    it->it_flags |= ITEM_STALE;
+                }
+
+                if (of.no_reply)
+                    resp->skip = true;
+
+                memcpy(resp->wbuf, "HD", 2);
+            } else {
+                errstr = "SERVER_ERROR out of memory";
+                goto error;
+            }
+        } else {
+            pthread_mutex_lock(&t->stats.mutex);
+            t->stats.delete_misses++;
+            pthread_mutex_unlock(&t->stats.mutex);
+
+            memcpy(resp->wbuf, "NF", 2);
+            goto cleanup;
+        }
     }
 cleanup:
     if (it) {
