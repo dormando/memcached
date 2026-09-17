@@ -284,6 +284,45 @@ subtest 'md with CAS' => sub {
     like(scalar <$sock>, qr/^HD/, "mdeleted key");
 };
 
+### TODO NEW TESTS:
+# - ms with W
+#   - CAS and no CAS and E + now CAS and E + CAS
+#   - lower CAS, equal CAS, higher CAS
+#   - with I
+#   - MR/MA/etc
+#   - on all stages, fetch and validate CAS is as expected
+# - md with W
+#   - no CAS, CAS
+#   - x, no x, x + I
+#   - low, equal, high
+#   - re-fetch and ensure CAS and value are correct
+
+subtest 'ms W flag LWW' => sub {
+    my $k = 'lww1';
+    print $sock "ms $k 2 c\r\nqu\r\n";
+    my $res = parse_res(scalar <$sock>);
+    ok($res && $res->{status} eq 'HD', "proper response");
+    my $cas = get_flag($res, 'c');
+    ok($cas, "cas is defined and nonzero");
+
+    # With W flag, attempt: CAS low, equal, high
+    for my $t ([$cas-1, "EX"], [$cas, "EX"], [$cas+1, "HD"]) {
+        my $ncas = $t->[0];
+        ok($ncas != 0);
+        print $sock "ms $k 2 W c C$ncas\r\nxx\r\n";
+        my $res = parse_res(scalar <$sock>);
+        ok($res && $res->{status} eq $t->[1], "proper response: $res->{status}");
+        if ($res->{status} eq 'HD') {
+            my $rc = get_flag($res, 'c');
+            is($rc, $cas+1, "HD updated CAS");
+        }
+    }
+
+    # TODO: decide: If W inherits C then E becomes pointless with W.
+    # Are there cases where this needs to differ?
+    # Does E become required to stay consistent?
+};
+
 subtest 'encoded binary keys' => sub {
     # 44OG44K544OI is "tesuto" in katakana
     my $tesuto = "44OG44K544OI";
@@ -866,9 +905,14 @@ sub mget_res {
 sub parse_res {
     my $resp = shift;
     my %r = ();
-    if ($resp =~ m/^(\w\w)\s*([^\r]+)\r\n/gm) {
+    if ($resp =~ m/^(\w\w)\s+([^\r]+)\r\n/gm) {
         $r{status} = $1;
         $r{flags} = $2;
+    } elsif ($resp =~ m/^(CLIENT|SERVER|ERROR)/) {
+        fail("bad result: $resp");
+        return undef;
+    } else {
+        return undef;
     }
 
     return \%r;

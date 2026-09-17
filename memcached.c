@@ -1564,12 +1564,18 @@ enum store_item_type do_store_item(item *it, int comm, LIBEVENT_THREAD *t, const
         uint64_t old_cas = ITEM_get_cas(old_it);
         if (it_cas == 0) {
             cas_res = CAS_NONE;
+        } else if (cas_lww) {
+            if (it_cas > old_cas) {
+                cas_res = CAS_MATCH;
+            } else if (cas_stale) {
+                cas_res = CAS_STALE;
+            } else {
+                cas_res = CAS_BADVAL;
+            }
         } else if (it_cas == old_cas) {
             cas_res = CAS_MATCH;
         } else if (cas_stale && it_cas < old_cas) {
             cas_res = CAS_STALE;
-        } else if (cas_lww && it_cas > old_cas) {
-            cas_res = CAS_MATCH;
         } else {
             cas_res = CAS_BADVAL;
         }
