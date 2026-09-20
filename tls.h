@@ -9,6 +9,8 @@
 #ifdef TLS
 void *ssl_accept(conn *c, int sfd, bool *fail);
 const unsigned char *ssl_get_peer_cn(conn *c, int *len);
+int ssl_oid_to_nid(const char *oid);
+const unsigned char *ssl_get_peer_ext_by_nid(conn *c, int nid, int *len);
 int ssl_init(void);
 void ssl_init_settings(void);
 void ssl_init_conn(conn *c, void *ssl);
