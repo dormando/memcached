@@ -21,6 +21,7 @@ void ssl_help(void);
 bool ssl_set_verify_mode(int verify);
 bool ssl_set_min_version(int version);
 const char *ssl_proto_text(int version);
+#define ssl_is_compiled(void) 1
 #else
 #define ssl_init(void)
 #define ssl_init_conn(c, ssl)
@@ -28,7 +29,10 @@ const char *ssl_proto_text(int version);
 #define ssl_conn_close(ssl)
 #define ssl_pending(ssl) 0
 #define ssl_accept(c, sfd, fail) NULL
+#define ssl_get_peer_cn(c, len) NULL
+#define ssl_get_peer_ext_by_nid(c, nid, len) NULL
 #define ssl_help()
+#define ssl_is_compiled(void) 0
 #endif
 
 #endif
